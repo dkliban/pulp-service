@@ -475,6 +475,8 @@ objects:
             value: ${PULP_TOKEN_AUTH_DISABLED}
           - name: PULP_USE_UVLOOP
             value: ${PULP_USE_UVLOOP}
+          - name: PULP_REDIRECT_TO_OBJECT_STORAGE
+            value: "False"
 
     - name: worker
       replicas: ${{PULP_WORKER_REPLICAS}}
@@ -713,7 +715,7 @@ objects:
           args:
           - "-c"
           - |
-            pulp config create --base-url http://pulp-api:8000 --api-root /api/pulp/ --username admin --password "$PULP_ADMIN_PASSWORD" --domain default
+            pulp config create --base-url http://pulp-api:8000 --api-root /api/pulp/ --username admin --password "$PULP_ADMIN_PASSWORD" --domain rhel-ai
             pulp rpm remote create --name gaudi --url https://vault.habana.ai/artifactory/rhel/9/9.2/ --policy immediate
             pulp rpm repository create --name gaudi --remote gaudi
             pulp rpm repository sync --name gaudi
@@ -864,7 +866,7 @@ objects:
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdJobInvocation
   metadata:
-    name: create-repos2
+    name: create-repos7
   spec:
     appName: pulp
     jobs:
@@ -891,7 +893,7 @@ parameters:
     value: "0" # setting to 0 because we are using an ingress as a reverse proxy
   - name: PULP_WORKER_REPLICAS
     description: Number of pulp workers
-    value: "1"
+    value: "2"
   - name: PULP_CONTENT_REPLICAS
     description: Number of pulp content replicas
     value: "1"
