@@ -703,6 +703,123 @@ objects:
               value: "/tmp"
             - name: XDG_CACHE_HOME
               value: "/tmp"
+      - name: create-repos
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command: [ '/bin/sh' ]
+          args:
+          - "-c"
+          - |
+            pulp config create --base-url http://pulp-api:8000 --api-root /api/pulp/ --username admin --password "$PULP_ADMIN_PASSWORD" --domain default
+            pulp rpm remote create --name gaudi --url https://vault.habana.ai/artifactory/rhel/9/9.2/
+            pulp rpm remote create --name mkl --url https://yum.repos.intel.com/mkl/
+            pulp rpm repository create --name gaudi --remote --gaudi
+            pulp rpm repository create 
+            pulp user create --username contentsources --password "$CONTENT_SOURCES_PASSWORD" || true
+            pulp user role-assignment add --username contentsources --role domain.admin --object "" #Last command will fail if the first two have
+          env:
+            - name: PULP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-admin-password
+                  key: password
+                  optional: false
+            - name: CONTENT_SOURCES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-content-sources-password
+                  key: password
+                  optional: false
+            - name: XDG_CONFIG_HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp"
+      - name: create-rhel-ai-domain
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command: [ '/bin/sh' ]
+          args:
+          - "-c"
+          - |
+            pulp config create --base-url http://pulp-api:8000 --api-root /api/pulp/ --username admin --password "$PULP_ADMIN_PASSWORD" --domain default
+            pulp domain create --name rhel-ai --storage-class storages.backends.s3boto3.S3Boto3Storage --storage-settings "$(python3 /tmp/domain-storage-script.py)"
+          volumeMounts:
+            - name: domain-storage-config
+              mountPath: /tmp/domain-storage-script.py
+              subPath: domain-storage-script
+            - name: pulp-settings
+              mountPath: "/etc/pulp/settings.py"
+              subPath: "settings.py"
+            - name: secret-volume
+              mountPath: "/etc/pulp/keys"
+          volumes:
+            - name: domain-storage-config
+              configMap:
+                name: domain-storage-map
+            - name: pulp-settings
+              secret:
+                secretName: pulp-settings
+            - name: secret-volume
+              secret:
+                secretName: pulp-db-fields-encryption
+          env:
+            - name: PULP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-admin-password
+                  key: password
+                  optional: false
+            - name: XDG_CONFIG_HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp"
+            - name: PULP_CONTENT_ORIGIN
+              value: ${{PULP_CONTENT_ORIGIN}}
+            - name: PULP_DB_ENCRYPTION_KEY
+              value: ${{PULP_DB_ENCRYPTION_KEY}}
+      - name: create-pulp-services-admin-users
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command: [ 'pulpcore-manager' ]
+          args:
+            - "shell"
+            - "-c"
+            - |
+              from os import getenv
+              from django.contrib.auth import get_user_model
+              usernames=getenv("PULP_LIST_OF_ADMINS").split(',')
+              if not usernames:
+                quit()
+              User = get_user_model()
+              for username in usernames:
+                user, created = User.objects.get_or_create(username=username)
+                if not user.is_superuser:
+                  user.is_superuser = True
+                  user.save()
+          env:
+            - name: XDG_CONFIG_HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp"
+            - name: PULP_CONTENT_ORIGIN
+              value: ${{PULP_CONTENT_ORIGIN}}
+            - name: PULP_DB_ENCRYPTION_KEY
+              value: ${{PULP_DB_ENCRYPTION_KEY}}
+            - name: PULP_LIST_OF_ADMINS
+              value: ${{PULP_LIST_OF_ADMINS}}
+          volumeMounts:
+            - name: secret-volume
+              mountPath: "/etc/pulp/keys"
+            - name: pulp-settings
+              mountPath: "/etc/pulp/settings.py"
+              subPath: "settings.py"
+          volumes:
+            - name: secret-volume
+              secret:
+                secretName: pulp-db-fields-encryption
+            - name: pulp-settings
+              secret:
+                secretName: pulp-settings
 
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdJobInvocation
@@ -884,7 +1001,7 @@ parameters:
     value: "true"
   - name: PULP_ALLOWED_CONTENT_CHECKSUMS
     description: Checksums that Pulp can use to validate packages.
-    value: "[\"sha224\", \"sha256\", \"sha384\", \"sha512\"]"
+    value: "[\"sha1\", \"sha224\", \"sha256\", \"sha384\", \"sha512\"]"
   - name: PULP_API_GUNICORN_WORKERS
     description: Number of gunicorn workers in the API pods
     value: "1"
