@@ -360,7 +360,10 @@ objects:
       webServices:
         public:
           enabled: true
-          apiPath: pulp-content
+          apiPaths:
+            - /api/pulp-c/
+          whitelistPaths:
+            - /api/pulp-c/
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
         command: ['pulpcore-content', '-b', '0.0.0.0:8000', '--access-logfile', '-', '--access-logformat', '%a %t "%r" %s %b "%{Referer}i" "%{User-Agent}i" "%{X-PULP-CACHE}o" "%{X-PULP-ARTIFACT-SIZE}o" "%{X-RH-ORG-ID}o"']
@@ -711,12 +714,16 @@ objects:
           - "-c"
           - |
             pulp config create --base-url http://pulp-api:8000 --api-root /api/pulp/ --username admin --password "$PULP_ADMIN_PASSWORD" --domain default
-            pulp rpm remote create --name gaudi --url https://vault.habana.ai/artifactory/rhel/9/9.2/
+            pulp rpm remote create --name gaudi --url https://vault.habana.ai/artifactory/rhel/9/9.2/ --policy immediate
+            pulp rpm repository create --name gaudi --remote gaudi
+            pulp rpm repository sync --name gaudi
+            pulp rpm publication create --repository gaudi --checksum-type sha256
+            pulp rpm distribution create --name gaudi --repository gaudi --base-path gaudi
             pulp rpm remote create --name mkl --url https://yum.repos.intel.com/mkl/
-            pulp rpm repository create --name gaudi --remote --gaudi
-            pulp rpm repository create 
-            pulp user create --username contentsources --password "$CONTENT_SOURCES_PASSWORD" || true
-            pulp user role-assignment add --username contentsources --role domain.admin --object "" #Last command will fail if the first two have
+            pulp rpm repository create --name mkl --remote mkl
+            pulp rpm repository sync --name mkl
+            pulp rpm publication create --repository mkl --checksum-type sha256
+            pulp rpm distribution create --name mkl --repository mkl --base-path mkl
           env:
             - name: PULP_ADMIN_PASSWORD
               valueFrom:
@@ -846,6 +853,22 @@ objects:
     appName: pulp
     jobs:
       - create-contentsources-user
+- apiVersion: cloud.redhat.com/v1alpha1
+  kind: ClowdJobInvocation
+  metadata:
+    name: create-rhel-ai-domain
+  spec:
+    appName: pulp
+    jobs:
+      - create-rhel-ai-domain
+- apiVersion: cloud.redhat.com/v1alpha1
+  kind: ClowdJobInvocation
+  metadata:
+    name: create-repos2
+  spec:
+    appName: pulp
+    jobs:
+      - create-repos
 
 parameters:
   - name: ENV_NAME
