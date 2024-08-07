@@ -614,7 +614,8 @@ objects:
                 optional: true
           - name: PULP_ALLOWED_CONTENT_CHECKSUMS
             value: ${PULP_ALLOWED_CONTENT_CHECKSUMS}
-
+          - name: PULP_REDIRECT_TO_OBJECT_STORAGE
+            value: "False"
     database:
       name: pulp
       version: 15
@@ -866,7 +867,7 @@ objects:
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdJobInvocation
   metadata:
-    name: create-repos7
+    name: create-repos10
   spec:
     appName: pulp
     jobs:
@@ -920,7 +921,7 @@ parameters:
     value: "256Mi"
   - name: PULP_CONTENT_MEMORY_REQUEST
     description: Amount of memory to request for Content pods
-    value: "256Mi"
+    value: "512Mi"
   - name: PULP_WORKER_MEMORY_REQUEST
     description: Amount of memory to request for Worker pods
     value: "1024Mi"
