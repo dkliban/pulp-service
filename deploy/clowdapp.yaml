@@ -921,7 +921,7 @@ parameters:
     value: "256Mi"
   - name: PULP_CONTENT_MEMORY_REQUEST
     description: Amount of memory to request for Content pods
-    value: "512Mi"
+    value: "1024Mi"
   - name: PULP_WORKER_MEMORY_REQUEST
     description: Amount of memory to request for Worker pods
     value: "1024Mi"
@@ -930,7 +930,7 @@ parameters:
     value: "512Mi"
   - name: PULP_CONTENT_MEMORY_LIMIT
     description: Limit of memory use by Content pods
-    value: "512Mi"
+    value: "2048Mi"
   - name: PULP_WORKER_MEMORY_LIMIT
     description: Limit of memory use by Worker pods
     value: "2048Mi"
