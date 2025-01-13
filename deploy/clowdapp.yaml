@@ -867,7 +867,7 @@ objects:
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdJobInvocation
   metadata:
-    name: create-repos10
+    name: create-repos11
   spec:
     appName: pulp
     jobs:
