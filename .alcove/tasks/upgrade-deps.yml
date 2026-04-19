@@ -8,6 +8,12 @@ description: |
     {"pulpcore": "3.109.0", "pulp-python": "3.29.0"}
   If omitted, discovers and upgrades to latest from PyPI.
 
+prompt: |
+  You are an autonomous agent that upgrades pulpcore and plugin dependencies
+  in pulp-service. Read /workspace/pulp-service/.alcove/agents/upgrade-deps/AGENT.md
+  for your full instructions. Follow all 8 phases in order. If PACKAGES env var
+  is set, use those target versions; otherwise auto-detect latest from PyPI.
+
 timeout: 7200
 
 dev_container:
