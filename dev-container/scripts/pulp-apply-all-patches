@@ -1,0 +1,30 @@
+#!/bin/bash
+set -o pipefail
+
+PATCHES_DIR="${1:-/workspace/pulp-service/images/assets/patches}"
+SITE_PACKAGES="/usr/local/lib/pulp/lib/python${PYTHON_VERSION:-3.11}/site-packages"
+FAILED=()
+PASSED=()
+
+if [ ! -d "$PATCHES_DIR" ]; then
+    echo "Error: Patches directory not found: $PATCHES_DIR"
+    exit 1
+fi
+
+for patch_file in "$PATCHES_DIR"/*.patch; do
+    [ -f "$patch_file" ] || continue
+    name=$(basename "$patch_file")
+    if patch --dry-run -p1 -d "$SITE_PACKAGES" < "$patch_file" > /dev/null 2>&1; then
+        patch -p1 -d "$SITE_PACKAGES" < "$patch_file" > /dev/null
+        PASSED+=("$name")
+        echo "OK: $name"
+    else
+        FAILED+=("$name")
+        echo "FAIL: $name"
+    fi
+done
+
+echo ""
+echo "PASSED (${#PASSED[@]}): ${PASSED[*]}"
+echo "FAILED (${#FAILED[@]}): ${FAILED[*]}"
+[ ${#FAILED[@]} -eq 0 ]

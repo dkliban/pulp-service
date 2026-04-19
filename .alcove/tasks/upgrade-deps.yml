@@ -1,0 +1,19 @@
+name: Upgrade Pulp Dependencies
+description: |
+  Upgrades pulpcore and/or plugin versions in pulp-service.
+  Bumps versions in requirements.txt, resolves patch conflicts,
+  runs migrations and tests, fixes failures, and opens a PR.
+
+  Pass PACKAGES as JSON to target specific versions, e.g.:
+    {"pulpcore": "3.109.0", "pulp-python": "3.29.0"}
+  If omitted, discovers and upgrades to latest from PyPI.
+
+timeout: 7200
+
+dev_container:
+  image: ghcr.io/pulp/hosted-pulp-dev-env:main
+
+repos:
+  - url: https://github.com/pulp/pulp-service
+    ref: main
+    name: pulp-service
