@@ -16,6 +16,10 @@ prompt: |
 
 timeout: 7200
 
+schedule:
+  cron: "0 8 * * 1"
+  enabled: true
+
 dev_container:
   image: ghcr.io/pulp/hosted-pulp-dev-env:main
 
