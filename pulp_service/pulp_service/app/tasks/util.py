@@ -53,6 +53,15 @@ def register_pypi_yank_monitor_schedule():
     )
 
 
+def register_stale_lock_cleanup_schedule():
+    name = "Clean up stale Redis locks"
+    task_name = "pulp_service.app.tasks.stale_lock_cleanup.cleanup_stale_locks"
+    TaskSchedule.objects.update_or_create(
+        name=name,
+        defaults={"task_name": task_name, "dispatch_interval": timedelta(hours=6)},
+    )
+
+
 def no_op_task():
     with connections["default"].cursor() as cursor:
         cursor.execute("SELECT 1")
