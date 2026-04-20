@@ -1,0 +1,57 @@
+name: Build agent-splunk
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/agents/agent-splunk/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      - name: Build
+        working-directory: tools/agents/agent-splunk
+        run: CGO_ENABLED=0 go build -o agent-splunk .
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: agent-splunk
+          path: tools/agents/agent-splunk/agent-splunk
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="agent-splunk-$(date +'%Y%m%d')-${GITHUB_SHA::7}"
+          fi
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Download binary artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: agent-splunk
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" agent-splunk --clobber
+          else
+            gh release create "$TAG" \
+              --title "agent-splunk $TAG" \
+              agent-splunk
+          fi

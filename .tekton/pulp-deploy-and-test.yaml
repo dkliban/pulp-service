@@ -1,0 +1,1292 @@
+# Adapted from https://github.com/RedHatInsights/bonfire-tekton/blob/main/pipelines/basic.yaml
+# But the change is to run our functional test script rather than the IQE tests.
+# Keep in sync with it.
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: bonfire
+  annotations:
+  labels:
+    build.appstudio.redhat.com/pipeline: "bonfire"
+spec:
+  params:
+    - name: URL
+      type: string
+      description: URL of the Git repository use for fetching the tasks
+      default: 'https://github.com/RedHatInsights/bonfire-tekton'
+    - name: URL_ORIG
+      type: string
+      description: URL of the Git repository use for fetching the tasks
+      default: 'https://github.com/RedHatInsights/bonfire-tekton'
+    - name: REVISION
+      type: string
+      description: Git commit revision to use for fetching the tasks
+      default: main
+    - name: REVISION_ORIG
+      type: string
+      description: Git commit revision to use for fetching the tasks
+      default: main
+    - name: BONFIRE_IMAGE
+      type: string
+      description: The container Bonfire image to use for the tekton tasks
+      default: quay.io/redhat-services-prod/hcm-eng-prod-tenant/cicd-tools:latest
+    - name: SNAPSHOT
+      type: string
+      description: |
+        Spec section of an ApplicationSnapshot resource. Not all fields of the
+        resource are required. A minimal example:
+          {
+            "components": [
+              {
+                "containerImage": "quay.io/example/repo:latest"
+              }
+            ]
+          }
+        Each "containerImage" in the "components" array is validated.
+    - name: EPHEMERAL_ENV_PROVIDER_SECRET
+      type: string
+      default: ephemeral-env-provider
+      description: "Secret for connecting to ephemeral env provider cluster"
+    - name: APP_INTERFACE_SECRET
+      type: string
+      default: app-interface
+      description: "Secret for connecting to app-interface"
+    - name: APP_NAME
+      type: string
+      description: name of app-sre "application" folder this component lives in
+      default: "pulp"
+    - name: COMPONENTS
+      type: string
+      description: space-separated list of components to load
+      default: ""
+    - name: COMPONENTS_W_RESOURCES
+      type: string
+      description: component to keep
+      default: ""
+    - name: AWS_SECRET
+      type: string
+      default: rh-artifacts-bucket
+      description: Secret with connection details to S3
+    - name: BONFIRE_COMPONENT_NAME
+      type: string
+      default: ""
+      description: name of the app-sre component name
+    - name: COMPONENT_NAME
+      type: string
+      description: name of app-sre "resourceTemplate" in deploy.yaml for this component
+      default: "pulp"
+    - name: EXTRA_DEPLOY_ARGS
+      type: string
+      description: "Extra arguments for the deployment"
+      default: ""
+    - name: DEPLOY_FRONTENDS
+      type: string
+      description: "Deploy frontend in the env or not"
+      default: ""
+    - name: PULP_CREDENTIALS
+      type: string
+      default: pulp-sa-cert
+      description: "Secret for connecting to python-bindings domain in prod pulp."
+    - name: PULP_BINDINGS_COMPONENTS
+      type: string
+      description: space-separated list of Pulp components to generate the bindings
+      default: "pulpcore pulp_python pulp_npm pulp_gem pulp_rpm pulp_maven pulp_file pulp_service"
+    - name: BINDINGS_TEMPLATES
+      type: string
+      description: space-separated list of openapi-generator mustache template files
+      default: "configuration partial_api_args requirements setup"
+    - name: TEMPLATE_VERSION
+      type: string
+      default: "v7.10.0"
+    - name: PYPI_API_TOKEN
+      type: string
+      default: pypi-token
+      description: "Secret with the token to push bindings to PyPI"
+
+  results:
+    - name: ARTIFACTS_URL
+      description: URL for the test's artifacts
+      value: $(finally.teardown.results.ARTIFACTS_URL)
+  finally:
+    - name: teardown
+      params:
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: NS_REQUESTER
+          value: "$(context.pipelineRun.name)"
+        - name: ARTIFACTS_KEY
+          value: "$(context.pipelineRun.namespace)/$(context.pipelineRun.name)"
+        - name: AWS_SECRET
+          value: "$(params.AWS_SECRET)"
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: "$(params.URL_ORIG)"
+          - name: revision
+            value: "$(params.REVISION_ORIG)"
+          - name: pathInRepo
+            value: tasks/teardown.yaml
+  tasks:
+    - name: test-metadata
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/konflux-qe-definitions.git
+          - name: revision
+            value: main
+          - name: pathInRepo
+            value: tasks/test-metadata/0.1/test-metadata.yaml
+      params:
+        - name: SNAPSHOT
+          value: $(params.SNAPSHOT)
+        - name: oras-container
+          value: "dummy"
+        - name: test-name
+          value: $(context.pipelineRun.name)
+    - name: reserve-namespace
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      params:
+        - name: NS_REQUESTER
+          value: "$(context.pipelineRun.name)"
+        - name: EPHEMERAL_ENV_PROVIDER_SECRET
+          value: "$(params.EPHEMERAL_ENV_PROVIDER_SECRET)"
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: "$(params.URL_ORIG)"
+          - name: revision
+            value: "$(params.REVISION_ORIG)"
+          - name: pathInRepo
+            value: tasks/reserve-namespace.yaml
+      runAfter:
+        - test-metadata
+    - name: deploy-application
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: SNAPSHOT
+          value: "$(params.SNAPSHOT)"
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: NS_REQUESTER
+          value: "$(context.pipelineRun.name)"
+        - name: APP_INTERFACE_SECRET
+          value: "$(params.APP_INTERFACE_SECRET)"
+        - name: APP_NAME
+          value: "$(params.APP_NAME)"
+        - name: BONFIRE_COMPONENT_NAME
+          value: "$(params.BONFIRE_COMPONENT_NAME)"
+        - name: COMPONENTS
+          value: "$(params.COMPONENTS)"
+        - name: COMPONENTS_W_RESOURCES
+          value: "$(params.COMPONENTS_W_RESOURCES)"
+        - name: EXTRA_DEPLOY_ARGS
+          value: "$(params.EXTRA_DEPLOY_ARGS)"
+        - name: DEPLOY_FRONTENDS
+          value: "$(params.DEPLOY_FRONTENDS)"
+      runAfter:
+        - reserve-namespace
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: "$(params.URL_ORIG)"
+          - name: revision
+            value: "$(params.REVISION_ORIG)"
+          - name: pathInRepo
+            value: tasks/deploy.yaml
+    
+    - name: build-bindings
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: EPHEMERAL_ENV_PROVIDER_SECRET
+          value: "$(params.EPHEMERAL_ENV_PROVIDER_SECRET)"
+      runAfter:
+        - deploy-application
+      taskSpec:
+        params:
+          - name: BONFIRE_IMAGE
+            type: string
+            description: The container Bonfire image to use for the tekton tasks
+            default: quay.io/redhat-user-workloads/hcc-devprod-tenant/hcc-cicd-tools/cicd-tools:834176766e3f911ffa24bfacff59dd15126e4b3a
+          - name: EPHEMERAL_ENV_PROVIDER_SECRET
+            type: string
+            default: ephemeral-env-provider
+          - name: NS
+            type: string
+            description: Namespace name to deploy the application to
+          - name: BINDINGS_PVC
+            type: string
+            description: Name of the PVC to store the generated bindings
+            default: bindings
+          - name: TEMPLATE_VERSION
+            type: string
+            default: "v7.10.0"
+        steps:
+          - name: get-templates
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: BINDINGS_TEMPLATES
+                value: $(params.BINDINGS_TEMPLATES)
+              - name: TEMPLATE_LANG
+                value: "python"
+              - name: TEMPLATE_VERSION
+                value: $(params.TEMPLATE_VERSION)
+            script: |
+              set -ex
+              login.sh
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+              for TEMPLATE in $BINDINGS_TEMPLATES ; do
+                curl -s -O https://raw.githubusercontent.com/pulp/pulp-openapi-generator/refs/heads/main/templates/${TEMPLATE_LANG}/${TEMPLATE_VERSION}/${TEMPLATE}.mustache
+                if [ $? -ne 0 ]; then
+                  echo "Error: Failed to download template ${TEMPLATE}.mustache"
+                  exit 1
+                fi
+              done
+              oc_wrapper create configmap templates $(printf -- '--from-file=%s.mustache ' $BINDINGS_TEMPLATES)
+          - name: create-bindings-pvc
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: PVC_NAME
+                value: $(params.BINDINGS_PVC)
+              - name: PVC_SIZE
+                value: 100Mi
+              - name: SC_NAME
+                value: gp3
+            script: |
+              set -ex
+              login.sh
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              oc_wrapper apply -f-<<EOF
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: $PVC_NAME
+              spec:
+                storageClassName: $SC_NAME
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: $PVC_SIZE
+              EOF
+          - name: generate-bindings
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: BINDINGS_PVC
+                value: $(params.BINDINGS_PVC)
+              - name: TEMPLATE_VERSION
+                value: $(params.TEMPLATE_VERSION)
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+            script: |
+              set -ex
+              login.sh
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              PULP_API_HOST=$(oc_wrapper get routes pulp-api -ojsonpath='{.spec.host}')
+              for PACKAGE in $PULP_BINDINGS_COMPONENTS ; do
+              if [ "$PACKAGE" = "pulpcore" ]; then COMPONENT="core" ; else COMPONENT=${PACKAGE#"pulp_"} ; fi
+              oc_wrapper apply -f-<<EOF
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: ${PACKAGE//_/-}-bindings
+              spec:
+                template:
+                  metadata:
+                    labels:
+                      pod: bindings
+                  spec:
+                    affinity:
+                      podAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                        - labelSelector:
+                            matchExpressions:
+                            - key: pod
+                              operator: In
+                              values:
+                              - bindings
+                          topologyKey: kubernetes.io/hostname
+                    containers:
+                    - args:
+                      - generate
+                      - -i
+                      - /home/store/api-${PACKAGE//_/-}.json
+                      - -g
+                      - python
+                      - -o
+                      - /home/store/${PACKAGE//_/-}
+                      - --additional-properties=packageName=pulpcore.client.${PACKAGE},projectName=${PACKAGE}-client,packageVersion=1.0,domainEnabled=true
+                      - --http-user-agent=crc-pulp-client
+                      - -t
+                      - /tmp/templates
+                      - --skip-validate-spec
+                      - --strict-spec=false
+                      image: docker.io/openapitools/openapi-generator-cli:${TEMPLATE_VERSION}
+                      name: pulp-openapi-generator
+                      volumeMounts:
+                      - mountPath: /home/store
+                        name: store
+                      - name: templates
+                        mountPath: /tmp/templates
+                    initContainers:
+                    - name: wait-for-api-schema
+                      image: quay.io/curl/curl
+                      command: ["/bin/sh", "-c"]
+                      args:
+                      - >
+                        curl --retry-all-errors --fail --retry-delay 15 --retry 30 --retry-max-time 900 https://${PULP_API_HOST}/api/pulp/api/v3/docs/api.json
+                    - name: get-pulp-api-schema
+                      args:
+                      - -k
+                      - -o
+                      - /data/api-${PACKAGE//_/-}.json
+                      - https://${PULP_API_HOST}/api/pulp/api/v3/docs/api.json?bindings&component=${COMPONENT}
+                      image: quay.io/curl/curl
+                      volumeMounts:
+                      - mountPath: /data
+                        name: store
+                    restartPolicy: Never
+                    volumes:
+                    - name: store
+                      persistentVolumeClaim:
+                        claimName: $BINDINGS_PVC
+                    - name: templates
+                      configMap:
+                        name: templates
+              EOF
+              done
+
+              # make sure all jobs finished before proceeding to the next step
+              PULP_BINDINGS_COMPONENTS=`echo $PULP_BINDINGS_COMPONENTS|tr '_' '-'`
+              for PACKAGE in $PULP_BINDINGS_COMPONENTS ; do
+              oc_wrapper wait --for=condition=complete --timeout=600s job/${PACKAGE}-bindings
+              done
+
+    - name: install-bindings
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: EPHEMERAL_ENV_PROVIDER_SECRET
+          value: "$(params.EPHEMERAL_ENV_PROVIDER_SECRET)"
+      runAfter:
+        - build-bindings
+      taskSpec:
+        params:
+          - name: BONFIRE_IMAGE
+            type: string
+            description: The container Bonfire image to use for the tekton tasks
+            default: quay.io/redhat-user-workloads/hcc-devprod-tenant/hcc-cicd-tools/cicd-tools:834176766e3f911ffa24bfacff59dd15126e4b3a
+          - name: EPHEMERAL_ENV_PROVIDER_SECRET
+            type: string
+            default: ephemeral-env-provider
+          - name: NS
+            type: string
+            description: Namespace name to deploy the application to
+          - name: BINDINGS_PVC
+            type: string
+            description: Name of the PVC with the generated bindings
+            default: bindings
+        steps:
+          - name: create-pvc
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+            script: |
+              set -ex
+
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              # Create a new volume that will be used as python modules path
+              oc_wrapper apply -f-<<EOF
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: python-path
+              spec:
+                storageClassName: gp3
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 2Gi
+              EOF
+
+          - name: generate-attestation-test-keys
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+            script: |
+              set -ex
+
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              # Generate an RSA-4096 test keypair for attestation verification tests.
+              # Run inside the pulp-api container which has the cryptography library.
+              oc_wrapper exec -c pulp-api deployment/pulp-api -- python3 -c "
+              from cryptography.hazmat.primitives.asymmetric import rsa
+              from cryptography.hazmat.primitives import serialization
+              key = rsa.generate_private_key(65537, 4096)
+              open('/tmp/test-key-private.pem','wb').write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+              open('/tmp/test-key.pem','wb').write(key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+              "
+
+              # Copy the generated keys out of the container
+              oc_wrapper exec -c pulp-api deployment/pulp-api -- cat /tmp/test-key.pem > /tmp/test-key.pem
+              oc_wrapper exec -c pulp-api deployment/pulp-api -- cat /tmp/test-key-private.pem > /tmp/test-key-private.pem
+
+              oc_wrapper create configmap attestation-test-keys \
+                --from-file=test-key.pem=/tmp/test-key.pem \
+                --from-file=test-key-private.pem=/tmp/test-key-private.pem \
+                --dry-run=client -o yaml | oc_wrapper apply -f -
+
+          - name: update-deployment-with-the-pvc
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: BINDINGS_PVC
+                value: $(params.BINDINGS_PVC)
+            script: |
+              set -ex
+
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              # Disable clowder to be able to apply our configs
+              oc_wrapper patch clowdapp pulp --type=merge -p '{"spec": {"disabled": true}}'
+
+              # Update the deployment to mount the volume with the bindings and install them
+              # Also mount the attestation test keys and override the verification key setting
+              oc_wrapper patch deployment pulp-api --type=strategic -p "$(cat<<EOF
+              {
+                "spec": {
+                  "strategy": { "rollingUpdate": null, "type": "Recreate" },
+                  "template": { 
+                    "spec": {
+                      "volumes": [  
+                        { "name": "bindings", "persistentVolumeClaim": { "claimName": "$BINDINGS_PVC"}},
+                        { "name": "python-path", "persistentVolumeClaim": { "claimName": "python-path"}},
+                        { "name": "attestation-test-keys", "configMap": { "name": "attestation-test-keys"}}
+                      ],
+                      "containers": [
+                        {
+                          "name": "pulp-api",
+                          "env": [
+                            {"name": "PULP_ATTESTATION_VERIFICATION_KEY", "value": "/etc/pki/attestation/test-key.pem"}
+                          ],
+                          "volumeMounts": [
+                            {"mountPath": "/data","name": "bindings"},
+                            {"mountPath": "/tmp/home/","name": "python-path"},
+                            {"mountPath": "/etc/pki/attestation","name": "attestation-test-keys","readOnly": true}
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              EOF
+              )"
+              oc_wrapper rollout status deployment/pulp-api --timeout=4m
+
+              # Also patch the worker deployment with the attestation test keys
+              oc_wrapper patch deployment pulp-worker --type=strategic -p "$(cat<<EOF
+              {
+                "spec": {
+                  "template": {
+                    "spec": {
+                      "volumes": [
+                        { "name": "attestation-test-keys", "configMap": { "name": "attestation-test-keys"}}
+                      ],
+                      "containers": [
+                        {
+                          "name": "pulp-worker",
+                          "env": [
+                            {"name": "PULP_ATTESTATION_VERIFICATION_KEY", "value": "/etc/pki/attestation/test-key.pem"}
+                          ],
+                          "volumeMounts": [
+                            {"mountPath": "/etc/pki/attestation","name": "attestation-test-keys","readOnly": true}
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              EOF
+              )"
+              oc_wrapper rollout status deployment/pulp-worker --timeout=4m
+
+          - name: install-pulp-clients
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+            script: |
+              set -ex
+
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              # Run a command
+              cmd_stdin_prefix() {
+                oc_wrapper exec -c pulp-api -i deployment/pulp-api -- "$@"
+              }
+
+              # INSTALL CLIENTS
+              PULP_BINDINGS_COMPONENTS=`echo $PULP_BINDINGS_COMPONENTS|tr '_' '-'`
+              for PACKAGE in $PULP_BINDINGS_COMPONENTS ; do
+                oc_wrapper exec -c pulp-api deployment/pulp-api -- bash -c "HOME=/tmp/home pip3 install /data/${PACKAGE}"
+              done
+
+              cat<<EOF > __tmp_init__.py
+              from pkgutil import extend_path
+              __path__ = extend_path(__path__, __name__)
+              EOF
+              cat __tmp_init__.py | cmd_stdin_prefix bash -c "cat > /tmp/home/.local/lib/python3.11/site-packages/pulpcore/__init__.py"
+              cat __tmp_init__.py | cmd_stdin_prefix bash -c "cat > /tmp/home/.local/lib/python3.11/site-packages/pulpcore/client/__init__.py"
+
+    - name: pulp-functional-tests
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      runAfter:
+        - install-bindings
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: EPHEMERAL_ENV_PROVIDER_SECRET
+          value: "$(params.EPHEMERAL_ENV_PROVIDER_SECRET)"
+      taskSpec:
+        params:
+          - name: BONFIRE_IMAGE
+            type: string
+            description: The container Bonfire image to use for the tekton tasks
+            default: quay.io/redhat-user-workloads/hcc-devprod-tenant/hcc-cicd-tools/cicd-tools:834176766e3f911ffa24bfacff59dd15126e4b3a
+          - name: EPHEMERAL_ENV_PROVIDER_SECRET
+            type: string
+            default: ephemeral-env-provider
+          - name: NS
+            type: string
+            description: Namespace name to deploy the application to
+        steps:
+          - name: functional-tests
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+            script: |
+              set -ex
+
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              PASSWORD=$(oc_wrapper extract secret/pulp-admin-password --to=-)
+
+              POD=$(oc_wrapper get pod | grep -oE "pulp-api\S*")
+              echo $POD
+              oc_wrapper get pod $POD -o yaml | grep memory:
+
+              oc_wrapper get clowdenvironment env-$(oc_wrapper project | grep -oE 'ephemeral-......') -o yaml
+
+              oc_wrapper get clowdapp pulp -o yaml
+
+              ### Adapted from ./.github/workflows/scripts/utils.sh
+              # Run a command
+              cmd_prefix() {
+                oc_wrapper exec -c pulp-api deployment/pulp-api -- "$@"
+              }
+
+              # Run a command, and pass STDIN
+              cmd_stdin_prefix() {
+                oc_wrapper exec -c pulp-api -i deployment/pulp-api -- "$@"
+              }
+              ### END Adapted from ./.github/workflows/scripts/utils.sh
+
+              debug_and_fail() {
+                oc_wrapper logs $(oc_wrapper get pod | grep -oE "pulp-content\S*")
+                oc_wrapper logs $(oc_wrapper get pod | grep -oE "pulp-api\S*")
+                for pod in $(oc_wrapper get pod | grep -oE "pulp-worker\S*"); do
+                  oc_wrapper logs "$pod"
+                done
+                echo "CURL OUTPUT"
+                curl https://env-${NS}.apps.crc-eph.r9lp.p1.openshiftapps.com/api/pulp-content/default/
+                echo "ROUTES"
+                oc_wrapper get route
+                exit 1
+              }
+
+              cmd_prefix bash -c "HOME=/tmp/home pip3 install pytest\<8 gnupg"
+
+              curl -o functest_requirements.txt https://raw.githubusercontent.com/pulp/pulp_rpm/main/functest_requirements.txt
+              curl -o unittest_requirements.txt https://raw.githubusercontent.com/pulp/pulp_rpm/main/unittest_requirements.txt
+
+              ### Adapted from ./.github/workflows/scripts/script.sh
+              cat unittest_requirements.txt | cmd_stdin_prefix bash -c "cat > /tmp/unittest_requirements.txt"
+              cat functest_requirements.txt | cmd_stdin_prefix bash -c "cat > /tmp/functest_requirements.txt"
+              cmd_prefix bash -c "HOME=/tmp/home pip3 install -r /tmp/unittest_requirements.txt -r /tmp/functest_requirements.txt"
+              # Because we pass the path to pytest -o cache_dir=/tmp/home/.cache/pytest_cache, pulpcore-manager must be in the same dir
+              cmd_prefix bash -c "ln -s /usr/local/lib/pulp/bin/pulpcore-manager /tmp/home/.local/bin/pulpcore-manager || /bin/true"
+              echo "CURL OUTPUT"
+              curl https://env-${NS}.apps.crc-eph.r9lp.p1.openshiftapps.com/api/pulp-content/default/
+              echo "ROUTES"
+              oc_wrapper get route
+              set +e
+              # Only testing test_download_content because it is a very thorough test that tests that all the components of pulp can work
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --suppress-no-test-exit-code --pyargs pulp_rpm.tests.functional -m parallel -n 8 -k 'test_download_content' --junitxml=/tmp/home/junit-pulp-parallel.xml" || debug_and_fail
+              # Never test test_package_manager_consume because they require sudo
+              # Do not test test_domain_create because it requires more than 2GB of RAM
+              # Only testing test_download_policies because they are very thorough tests that test that all the components of pulp can work
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --pyargs pulp_rpm.tests.functional -m 'not parallel' -k 'test_download_policies' --junitxml=/tmp/home/junit-pulp-serial.xml" || debug_and_fail
+
+              # Run the jq header auth test
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --pyargs pulpcore.tests.functional -m 'parallel' -n 8 -k 'test_jq_header_remote_auth' --junitxml=/tmp/home/junit-pulp-serial.xml" || debug_and_fail
+
+              ### END Adapted from ./.github/workflows/scripts/script.sh
+
+              # Run pulp_maven functional tests
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --pyargs pulp_maven.tests.functional.api.test_download_content --junitxml=/tmp/home/junit-pulp-serial.xml" || debug_and_fail
+
+              # Run pulp_npm functional tests
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --pyargs pulp_npm.tests.functional -k 'test_pull_through_install' --junitxml=/tmp/home/junit-pulp-serial.xml" || debug_and_fail
+
+              # Run pulp_service functional tests
+              cmd_prefix bash -c "HOME=/tmp/home PYTHONPATH=/tmp/home/.local/lib/python3.11/site-packages/ XDG_CONFIG_HOME=/tmp/home/.config API_PROTOCOL=http API_HOST=pulp-api API_PORT=8000 ADMIN_USERNAME=admin ADMIN_PASSWORD=$PASSWORD /tmp/home/.local/bin/pytest -o cache_dir=/tmp/home/.cache/pytest_cache -v -r sx --color=yes --pyargs pulp_service.tests.functional -m 'not parallel' --junitxml=/tmp/home/junit-pulp-serial.xml" || debug_and_fail
+
+    - name: push-api-json-files-to-pulp
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["pull_request"]
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: NS
+          value: "$(tasks.reserve-namespace.results.NS)"
+        - name: EPHEMERAL_ENV_PROVIDER_SECRET
+          value: "$(params.EPHEMERAL_ENV_PROVIDER_SECRET)"
+        - name: SNAPSHOT
+          value: "$(params.SNAPSHOT)"
+      runAfter:
+        - pulp-functional-tests
+      taskSpec:
+        params:
+          - name: BONFIRE_IMAGE
+            type: string
+            description: The container Bonfire image to use for the tekton tasks
+            default: quay.io/redhat-user-workloads/hcc-devprod-tenant/hcc-cicd-tools/cicd-tools:834176766e3f911ffa24bfacff59dd15126e4b3a
+          - name: EPHEMERAL_ENV_PROVIDER_SECRET
+            type: string
+            default: ephemeral-env-provider
+          - name: NS
+            type: string
+            description: Namespace name to deploy the application to
+          - name: PULP_CREDENTIALS
+            type: string
+            default: pulp-sa-cert
+          - name: PULP_DOMAIN
+            type: string
+            default: python-bindings
+          - name: PULP_FILE_REPO_NAME
+            type: string
+            default: python-bindings
+        steps:
+          - name: get-file-repo
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: PULP_DOMAIN
+                value: $(params.PULP_DOMAIN)
+              - name: PULP_CREDENTIALS
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.PULP_CREDENTIALS)
+                    key: pulp-sa-cert.pem
+            script: |
+              echo "$PULP_CREDENTIALS" > /workspace/pulp-sa-cert.pem
+              curl -s --cert /workspace/pulp-sa-cert.pem https://mtls.internal.console.redhat.com/api/pulp/${PULP_DOMAIN}/api/v3/repositories/file/file/?name=${PULP_FILE_REPO_NAME}|python3 -c "import json,sys;print(json.load(sys.stdin)['results'][0]['pulp_href'])" | tee /workspace/file_repo
+          - name: get-current-postn-and-increment-it
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: PULP_DOMAIN
+                value: $(params.PULP_DOMAIN)
+            script: |
+              CUR_DATE=$(date +%Y%m%d)
+              postN=$(curl -s --cert /workspace/pulp-sa-cert.pem https://mtls.internal.console.redhat.com/api/pulp/${PULP_DOMAIN}/api/v3/content/file/files/?relative_path__contains="pulpcore-$CUR_DATE" |python3 -c "import json,sys;results=json.load(sys.stdin)['results'];print(len(results))")
+              postN=$((postN + 1))
+              echo $postN | tee /workspace/postN
+          - name: get-commit-hash
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+            script: |
+              python3 <<EOF | tee /workspace/commit_sha
+              import json,os
+              snapshot=os.getenv("SNAPSHOT", "")
+              snapshotComponent=json.loads(snapshot)['components'][0]
+              commit_sha=snapshotComponent['source']['git']['revision'].removeprefix('sha256:')
+              print(commit_sha[:7])
+              EOF
+          - name: push-api-json-files-to-pulp
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: OC_LOGIN_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: token
+              - name: OC_LOGIN_SERVER
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.EPHEMERAL_ENV_PROVIDER_SECRET)
+                    key: url
+              - name: NS
+                value: $(params.NS)
+              - name: PULP_DOMAIN
+                value: $(params.PULP_DOMAIN)
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+              - name: PULP_CREDENTIALS
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.PULP_CREDENTIALS)
+                    key: pulp-sa-cert.pem
+            script: |
+              set -ex
+              login.sh
+
+              if [ -n "$NS" ]; then
+                oc_wrapper project $NS
+              else
+                export NS=$(oc_wrapper project | grep -oE 'ephemeral-......')
+              fi
+              echo "Namespace is $NS"
+
+              CUR_DATE=$(date +%Y%m%d)
+              POSTN=$(cat /workspace/postN)
+              SHORT_COMMIT_SHA=$(cat /workspace/commit_sha)
+              PULP_FILE_REPO=$(cat /workspace/file_repo)
+              PULP_BASE_URL="https://mtls.internal.console.redhat.com"
+              CERT="/workspace/pulp-sa-cert.pem"
+
+              # copy pulp certificate into API container
+              oc_wrapper exec -c pulp-api deployment/pulp-api -- bash -c "echo \"$PULP_CREDENTIALS\" > /tmp/pulp-sa-cert.pem"
+
+              # Phase 1: Upload each schema synchronously and collect content hrefs
+              # /upload/ is synchronous — returns content href directly, no task polling needed
+              CONTENT_HREFS=()
+
+              for PACKAGE in $PULP_BINDINGS_COMPONENTS; do
+                RELATIVE_PATH="${PACKAGE}-${CUR_DATE}.${POSTN}+${SHORT_COMMIT_SHA}"
+                FILENAME="api-${PACKAGE//_/-}.json"
+                echo "Uploading $FILENAME as $RELATIVE_PATH ..."
+
+                CONTENT_HREF=$(oc_wrapper exec -c pulp-api deployment/pulp-api -- bash -c \
+                  "curl -sf -XPOST --cert /tmp/pulp-sa-cert.pem \
+                    -F 'file=@/data/${FILENAME}' \
+                    -F 'relative_path=${RELATIVE_PATH}' \
+                    https://mtls.internal.console.redhat.com/api/pulp/${PULP_DOMAIN}/api/v3/content/file/files/upload/" \
+                  | python3 -c "import json,sys; print(json.load(sys.stdin)['pulp_href'])")
+
+                echo "Content href: $CONTENT_HREF"
+                CONTENT_HREFS+=("$CONTENT_HREF")
+              done
+
+              # Build modify JSON body with all collected hrefs
+              CONTENT_HREFS_JSON=$(python3 -c \
+                "import json,sys
+              hrefs = sys.argv[1:]
+              print(json.dumps({'add_content_units': hrefs}))
+              " "${CONTENT_HREFS[@]}")
+              echo "Modify payload: $CONTENT_HREFS_JSON"
+
+              # Single modify call — one new repository version for all content
+              echo "Adding all content units to repository in one version..."
+              MODIFY_RESPONSE=$(curl -sf -XPOST --cert "$CERT" \
+                -H "Content-Type: application/json" \
+                -d "$CONTENT_HREFS_JSON" \
+                "${PULP_BASE_URL}${PULP_FILE_REPO}modify/")
+
+              MODIFY_TASK_HREF=$(echo "$MODIFY_RESPONSE" | python3 -c \
+                "import json,sys; print(json.load(sys.stdin)['task'])")
+              echo "Modify task: $MODIFY_TASK_HREF"
+
+              # Poll the modify task until completion
+              while true; do
+                MODIFY_RESULT=$(curl -sf --cert "$CERT" "${PULP_BASE_URL}${MODIFY_TASK_HREF}")
+                MODIFY_STATE=$(echo "$MODIFY_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['state'])")
+                case "$MODIFY_STATE" in
+                  completed) break ;;
+                  failed|canceled)
+                    echo "ERROR: Modify task ended with state: $MODIFY_STATE" >&2
+                    echo "$MODIFY_RESULT" >&2
+                    exit 1 ;;
+                  *) sleep 5 ;;
+                esac
+              done
+              echo "Repository modify completed successfully."
+              echo "New repository version: $(echo "$MODIFY_RESULT" | python3 -c \
+                "import json,sys; print(json.load(sys.stdin).get('created_resources', ['(none)'])[0])")"
+
+    - name: publish-bindings-to-pypi
+      when:
+        - input: '$(tasks.test-metadata.results.test-event-type)'
+          operator: in
+          values: ["push"]
+      params:
+        - name: BONFIRE_IMAGE
+          value: "$(params.BONFIRE_IMAGE)"
+        - name: SNAPSHOT
+          value: "$(params.SNAPSHOT)"
+      runAfter:
+        - test-metadata
+      taskSpec:
+        params:
+          - name: BONFIRE_IMAGE
+            type: string
+            description: The container Bonfire image to use for the tekton tasks
+            default: quay.io/redhat-user-workloads/hcc-devprod-tenant/hcc-cicd-tools/cicd-tools:834176766e3f911ffa24bfacff59dd15126e4b3a
+          - name: PULP_CREDENTIALS
+            type: string
+            default: pulp-sa-cert
+          - name: PULP_DOMAIN
+            type: string
+            default: python-bindings
+          - name: TASK_RESULT_NOT_FOUND_NOTE
+            type: string
+            default: "OpenAPI schema not found! Maybe it was not pushed to Pulp yet. Skipping the next steps."
+        results:
+          - name: TEST_OUTPUT
+            description: The output of the step
+        steps:
+          - name: get-pulp-cert
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: PULP_CREDENTIALS
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.PULP_CREDENTIALS)
+                    key: pulp-sa-cert.pem
+            script: |
+              # store the cert+key in a file, so that we can use it in python requests
+              echo "$PULP_CREDENTIALS" > /workspace/pulp-sa-cert.pem
+
+          - name: get-commit-hash
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+            script: |
+              #!/usr/bin/env python3
+              import json,os,requests
+
+              # get the PR of the commit
+              snapshot=os.getenv("SNAPSHOT", "")
+              snapshot_component=json.loads(snapshot)['components'][0]
+              commit_hash_after_merge=snapshot_component['source']['git']['revision'].removeprefix('sha256:')
+              gh_pulls_url=f"https://api.github.com/repos/pulp/pulp-service/commits/{commit_hash_after_merge}/pulls"
+              response = requests.get(gh_pulls_url)
+              pr=response.json()[-1]['number']
+
+              # get the "original" (before merge) commit - this is the commit also used in api.json file name
+              gh_commit_from_pr_url=f"https://api.github.com/repos/pulp/pulp-service/pulls/{pr}/commits"
+              response = requests.get(gh_commit_from_pr_url)
+              if response.status_code != 200:
+                sys.exit(1)
+              with open("/workspace/commit_sha", "w") as file:
+                commit_sha = response.json()[-1]['sha'][:7] 
+                print(commit_sha)
+                file.write(commit_sha + "\n")
+
+          - name: get-the-list-of-files-to-download-from-pulp
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: PULP_DOMAIN
+                value: $(params.PULP_DOMAIN)
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              #!/usr/bin/env python3
+              import json, requests, os, sys
+              from datetime import datetime
+              with open("/workspace/commit_sha") as file:
+                commit_sha = file.read().strip()
+                print(commit_sha)
+
+              pulp_cert_file="/workspace/pulp-sa-cert.pem"
+              pulp_domain=os.getenv("PULP_DOMAIN","")
+              components = os.getenv("PULP_BINDINGS_COMPONENTS","")
+              with open("/workspace/list-of-api.json","w") as file:
+                for component in components.split(" "):
+                  files_url = f'https://mtls.internal.console.redhat.com/api/pulp/{pulp_domain}/api/v3/content/file/files/?relative_path__regex={component}-.*{commit_sha}'
+                  try:
+                    response = requests.get(url=files_url,cert=pulp_cert_file)
+                    response.raise_for_status()
+                  except requests.exceptions.HTTPError as err:
+                    print(err)
+                    sys.exit(1)
+                  results = response.json()['results']
+                  print(results)
+
+                  # exit step if openapi-schema is not found
+                  if not results:
+                    print("OpenAPI schema not found! Skipping step.")
+                    note = os.getenv("TASK_RESULT_NOT_FOUND_NOTE","")
+                    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    task_results = {"result":"SKIPPED","timestamp":timestamp,"note":note,"successes":0,"failures":0,"warnings":1}
+                    with open('$(results.TEST_OUTPUT.path)', 'w') as f:
+                      f.write(json.dumps(task_results))
+                    sys.exit(0)
+
+                  relative_path = results[0]['relative_path']
+                  print(relative_path)
+                  file.write(relative_path + "\n")
+
+          - name: download-api-json-files-from-pulp
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: PULP_DOMAIN
+                value: $(params.PULP_DOMAIN)
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              # skip step if openapi-schema is not found
+              if [ -f $(results.TEST_OUTPUT.path) ] ; then
+                grep "$TASK_RESULT_NOT_FOUND_NOTE" $(results.TEST_OUTPUT.path)
+                if [ $? -eq 0 ] ; then
+                  echo "OpenAPI schema not found! Skipping step."
+                  exit 0
+                fi
+              fi
+
+              mkdir -p /workspace/api-json-files ; cd $_
+              while read FILE ; do
+                curl -sLO --cert /workspace/pulp-sa-cert.pem https://mtls.internal.console.redhat.com/api/pulp-content/${PULP_DOMAIN}/python-bindings/${FILE}
+                if [ $? -ne 0 ]; then
+                  echo "Error: Failed to download ${FILE} from Pulp"
+                  exit 1
+                fi
+              done < /workspace/list-of-api.json
+
+          - name: get-latest-version-from-pypi
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: SNAPSHOT
+                value: $(params.SNAPSHOT)
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              #!/usr/bin/env python3
+              import json, os, requests, sys
+
+              # skip step if openapi-schema is not found
+              test_output_file="$(results.TEST_OUTPUT.path)"
+              if os.path.exists(test_output_file):
+                with open(test_output_file,'r') as f:
+                  file_content=json.loads(f.read())
+                not_found_note = os.getenv("TASK_RESULT_NOT_FOUND_NOTE","")
+                if file_content['note'] == not_found_note:
+                  print("OpenAPI schema not found! Skipping step.")
+                  sys.exit(0)
+
+              # get the latest pypi client version based on crc.pulpcore.client package
+              pypi_url = f"https://pypi.org/pypi/crc.pulpcore.client/json"
+              response = requests.get(pypi_url)
+              with open("/workspace/latest-version-from-pypi","w") as file:
+                latest_version = response.json()['info']['version']
+                print(latest_version)
+                file.write(latest_version + "\n")
+
+          - name: download-the-templates
+            image: "$(params.BONFIRE_IMAGE)"
+            env:
+              - name: BINDINGS_TEMPLATES
+                value: $(params.BINDINGS_TEMPLATES)
+              - name: TEMPLATE_LANG
+                value: python
+              - name: TEMPLATE_VERSION
+                value: $(params.TEMPLATE_VERSION)
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              # skip step if openapi-schema is not found
+              if [ -f $(results.TEST_OUTPUT.path) ] ; then
+                grep "$TASK_RESULT_NOT_FOUND_NOTE" $(results.TEST_OUTPUT.path)
+                if [ $? -eq 0 ] ; then
+                  echo "OpenAPI schema not found! Skipping step."
+                  exit 0
+                fi
+              fi
+
+              mkdir -p /workspace/templates ; cd $_
+              for TEMPLATE in $BINDINGS_TEMPLATES ; do
+                curl -s -LO https://raw.githubusercontent.com/pulp/pulp-openapi-generator/refs/heads/main/templates/${TEMPLATE_LANG}/${TEMPLATE_VERSION}/${TEMPLATE}.mustache
+                if [ $? -ne 0 ]; then
+                  echo "Error: Failed to download template ${TEMPLATE}.mustache"
+                  exit 1
+                fi
+              done
+
+          - name: generate-bindings
+            image: docker.io/openapitools/openapi-generator-cli:$(params.TEMPLATE_VERSION)
+            env:
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              #!/bin/bash
+
+              # skip step if openapi-schema is not found
+              if [ -f $(results.TEST_OUTPUT.path) ] ; then
+                grep "$TASK_RESULT_NOT_FOUND_NOTE" $(results.TEST_OUTPUT.path)
+                if [ $? -eq 0 ] ; then
+                  echo "OpenAPI schema not found! Skipping step."
+                  exit 0
+                fi
+              fi
+
+              set -ex
+              today=$(date +%Y%m%d)
+              latest_version_date=$(awk -F. '{print $1}' /workspace/latest-version-from-pypi)
+              latest_version_postN=$(awk -F. '{print $2}' /workspace/latest-version-from-pypi)
+              if [ "$latest_version_date" -eq "$today" ] ; then postN=$((latest_version_postN + 1)) ; else postN=1 ; fi
+              package_version="${today}.${postN}"
+              echo $package_version > /workspace/package_version
+
+              cat<<EOF>/tmp/__tmp_init__.py
+              from pkgutil import extend_path
+              __path__ = extend_path(__path__, __name__)
+              EOF
+
+              mkdir -p /workspace/bindings/
+              for component in $PULP_BINDINGS_COMPONENTS ; do 
+                package_name="crc-${component}-client"
+                api_file=$(grep $component /workspace/list-of-api.json)
+                /usr/local/bin/docker-entrypoint.sh generate \
+                  -i /workspace/api-json-files/$api_file \
+                  -g python \
+                  -o /workspace/bindings/$component \
+                  --additional-properties=packageName=pulpcore.client.${component},projectName=${package_name},packageVersion=${package_version},domainEnabled=true \
+                  --http-user-agent=crc-pulp-client \
+                  -t /workspace/templates \
+                  --skip-validate-spec \
+                  --strict-spec=false
+
+                cp /tmp/__tmp_init__.py /workspace/bindings/$component/pulpcore/__init__.py
+                cp /tmp/__tmp_init__.py /workspace/bindings/$component/pulpcore/client/__init__.py
+
+                # concatenate all docs
+                cat /workspace/bindings/$component/docs/*.md > /workspace/bindings/$component/crc-${component}-client.md
+
+                sed -i "/from setuptools import/i from pathlib import Path" /workspace/bindings/$component/setup.py
+                sed -i "/setup(/i docs = (docs_file).read_text()" /workspace/bindings/$component/setup.py
+                sed -i "/docs = /i docs_file = Path('/workspace/bindings/$component/crc-${component}-client.md')" /workspace/bindings/$component/setup.py
+                sed -i "/long_description=/,/# noqa: E501/c\    long_description=docs," /workspace/bindings/$component/setup.py
+                cat /workspace/bindings/$component/setup.py
+
+              done
+
+          - name: publish-bindings
+            image: docker.io/library/python:3.13-slim
+            env:
+              - name: PULP_BINDINGS_COMPONENTS
+                value: $(params.PULP_BINDINGS_COMPONENTS)
+              - name: PYPI_API_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.PYPI_API_TOKEN)
+                    key: token
+              - name: TASK_RESULT_NOT_FOUND_NOTE
+                value: $(params.TASK_RESULT_NOT_FOUND_NOTE)
+            script: |
+              # skip step if openapi-schema is not found
+              if [ -f $(results.TEST_OUTPUT.path) ] ; then
+                grep "$TASK_RESULT_NOT_FOUND_NOTE" $(results.TEST_OUTPUT.path)
+                if [ $? -eq 0 ] ; then
+                  echo "OpenAPI schema not found! Skipping step."
+                  exit 0
+                fi
+              fi
+
+              set -e
+              PKG_VERSION=$(cat /workspace/package_version)
+              pip install build packaging twine wheel
+              for PACKAGE in $PULP_BINDINGS_COMPONENTS ; do
+                python -m build /workspace/bindings/${PACKAGE}
+                twine check /workspace/bindings/${PACKAGE}/dist/*
+
+                twine upload --skip-existing -u __token__ -p "${PYPI_API_TOKEN}" /workspace/bindings/${PACKAGE}/dist/*
+              done

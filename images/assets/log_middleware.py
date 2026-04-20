@@ -1,0 +1,101 @@
+import base64
+import ipaddress
+import json
+import logging
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(process)d] [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger(__name__)
+
+
+class UserExtractionMiddleware:
+    """
+    WSGI middleware to extract user from X-RH-IDENTITY header and set REMOTE_USER.
+    This runs before gunicorn logs, so the user will be available in access logs.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        # Extract user from X-RH-IDENTITY header if present
+        rh_identity = environ.get("HTTP_X_RH_IDENTITY")
+        username = None
+        org_id = None
+
+        if rh_identity:
+            try:
+                decoded = base64.b64decode(rh_identity)
+                identity_data = json.loads(decoded)
+
+                if "identity" in identity_data:
+                    identity = identity_data["identity"]
+                    # User details (highest priority - most specific)
+                    if "user" in identity and "username" in identity["user"]:
+                        username = identity["user"]["username"]
+                    # Service account (x509 certificate)
+                    elif "x509" in identity and "subject_dn" in identity["x509"]:
+                        username = identity["x509"]["subject_dn"]
+                    # SAML user
+                    elif "associate" in identity and "email" in identity["associate"]:
+                        username = identity["associate"]["email"]
+                    # Turnpike registry-auth
+                    elif "registry" in identity and "username" in identity["registry"]:
+                        username = identity["registry"]["username"]
+
+                    # Org ID
+                    if "org_id" in identity:
+                        org_id = f"{identity['org_id']}"
+                    elif "registry" in identity and "org_id" in identity["registry"]:
+                        org_id = f"{identity['registry']['org_id']}"
+
+                    if not username and not org_id:
+                        log.warning(
+                            "X-RH-IDENTITY present but neither username nor org_id could be derived from identity header."
+                        )
+
+            except Exception as e:
+                log.error(
+                    f"Failed to extract user from RH Identity header: {e}",
+                    exc_info=True,
+                )
+
+        if username:
+            environ["REMOTE_USER"] = username
+        if org_id:
+            environ["ORG_ID"] = org_id
+
+        # Prepend True-Client-IP to X-Forwarded-For for Django middleware/auth.
+        true_client_ip = environ.get("HTTP_TRUE_CLIENT_IP", "").strip()
+        if true_client_ip:
+            try:
+                ipaddress.ip_address(true_client_ip)
+                xff = environ.get("HTTP_X_FORWARDED_FOR", "")
+                if xff:
+                    environ["HTTP_X_FORWARDED_FOR"] = f"{true_client_ip}, {xff}"
+                else:
+                    environ["HTTP_X_FORWARDED_FOR"] = true_client_ip
+            except ValueError:
+                pass
+
+        # Expose the (possibly modified) X-Forwarded-For as a plain environ key.
+        # Gunicorn's %({name}i)s reads raw request headers, not environ, so
+        # the log format uses %({X_FORWARDED_FOR}e)s to pick up this value.
+        xff_value = environ.get("HTTP_X_FORWARDED_FOR")
+        if xff_value:
+            environ["X_FORWARDED_FOR"] = xff_value
+
+        return self.app(environ, start_response)
+
+
+def post_worker_init(worker):
+    """
+    Gunicorn hook to wrap the WSGI application after worker initialization.
+    This is called after the worker has been initialized but before it starts serving requests.
+    """
+    log.info("Wrapping WSGI application with UserExtractionMiddleware")
+    worker.wsgi = UserExtractionMiddleware(worker.wsgi)

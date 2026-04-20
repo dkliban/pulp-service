@@ -1,67 +1,104 @@
 apiVersion: template.openshift.io/v1
 kind: Template
-labels:
-  app: pulp
-  template: pulp-clowdapp
 metadata:
-  annotations:
-    description: |-
-      A quick way to test and try Pulp running in OpenShift clusters. For more information about using this template see ...
-
-      WARNING: Any data stored will be lost upon pod destruction. Only use this template for testing.
-    openshift.io/display-name: Pulp (Ephemeral)
-    openshift.io/documentation-url: https://docs.pulpproject.org/pulpcore/
-    openshift.io/long-description: This template defines resources needed
-      to install Pulp. The database is stored in non-persistent storage,
-      so this configuration should be used for experimental purposes only.
-    openshift.io/support-url: https://github.com/pulp/pulp-operator/issues
-    samples.operator.openshift.io/version: 4.10.12
-    tags: quickstart,pulp
-    template.openshift.io/bindable: "false"
-    iconClass: icon-python
-  labels:
-    samples.operator.openshift.io/managed: "false"
-  name: pulp-clowdapp
+  name: pulp
 objects:
 - apiVersion: v1
   kind: ConfigMap
   metadata:
-    name: pulp-otel-collector-config
+    name: pulp-otel-config
   data:
-    otel-collector-config: |
+    config.yaml: |
       receivers:
         otlp:
           protocols:
             http:
-              endpoint: "0.0.0.0:4318"
-            grpc:
-              endpoint: "0.0.0.0:4317"
+              endpoint: 0.0.0.0:10000
+
+      processors:
+
+        memory_limiter:
+          check_interval: 2s
+          limit_mib: 200
+
+        filter/filter_pulp_api_request_duration:
+          metrics:
+            metric:
+            - 'not (name == "api.request_duration")'
+
+        filter/exclude_pulp_api:
+          metrics:
+            metric:
+            - 'name == "api.request_duration"'
+
+        attributes/remove_worker_name:
+          actions:
+          - key: worker.name
+            action: delete
+
+        batch/api_aggregation:
+          timeout: 14s
+
+        groupbyattrs/api_aggregation:
+          keys:
+          - api.request_duration
+
+        batch:
+        
       exporters:
         prometheus:
-          endpoint: "0.0.0.0:8889"
-        otlp:
-          endpoint: "http://pulp-otel-collector-svc:4317"
-          tls:
-            insecure: true
+          endpoint: "0.0.0.0:9000"
+          namespace: pulp
+          metric_expiration: 60m
+        
+      extensions:
+        health_check:
+          endpoint: 0.0.0.0:13133
+        
       service:
+        extensions: [health_check]
         pipelines:
-          metrics:
+        
+          metrics/aggregation:
             receivers: [otlp]
-            processors: []
+            processors: 
+            - memory_limiter
+            - filter/filter_pulp_api_request_duration
+            - attributes/remove_worker_name
+            - batch/api_aggregation
+            - groupbyattrs/api_aggregation
             exporters: [prometheus]
-          traces:
+        
+          metrics/main:
             receivers: [otlp]
-            processors: []
-            exporters: [otlp]
-
+            processors: 
+            - memory_limiter
+            - filter/exclude_pulp_api
+            - batch
+            exporters: [prometheus]
 - apiVersion: v1
   kind: ConfigMap
   metadata:
-    name: cs-config-sh-map
+    name: domain-storage-map
+  data:
+    domain-storage-script: |
+      from django.conf import settings
+      s = settings.storages.default.options
+      config = f"{{\"access_key\": \"{s.access_key}\", \"secret_key\": \"{s.secret_key}\", \"bucket_name\": \"{s.bucket_name}\", \"region_name\": \"us-east-1\", \"default_acl\": \"private\"}}"
+      print(config)
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: config-sh-map
   data:
     config-sh-file: |
       #!/bin/bash
       export PATH=${PATH}:/tmp/bin
+
+      curl -Lo /tmp/oc.tar.gz https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+
+      mkdir /tmp/bin
+      tar -C /tmp/bin -xf /tmp/oc.tar.gz oc kubectl
 
       kubectl get secret
       retVal=$?
@@ -71,7 +108,6 @@ objects:
          exit 0
       fi
 
-      mkdir /tmp/bin
       cd /tmp/bin
       curl -L -O https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
       mv jq-linux64 jq
@@ -91,17 +127,27 @@ objects:
       
       ENV_NAME=$(cat /cdapp/cdappconfig.json | ./jq -r '.metadata.envName')
 
-      HOST=${ENV_NAME}.apps.c-rh-c-eph.8p0c.p1.openshiftapps.com
+      HOST=${ENV_NAME}.apps.crc-eph.r9lp.p1.openshiftapps.com
 
       # Generate a db key
       openssl rand -base64 32 > /tmp/database_fields.symmetric.key
       kubectl create secret generic pulp-db-fields-encryption --from-file /tmp/database_fields.symmetric.key
+
+      # Generate admin password
+      openssl rand -base64 32 | tr -d '\n' > /tmp/password
+      kubectl create secret generic pulp-admin-password --from-file /tmp/password
+      rm /tmp/password
+
+      # Generate contentsources user password
+      openssl rand -base64 32 | tr -d '\n' > /tmp/password
+      kubectl create secret generic pulp-content-sources-password --from-file /tmp/password
 
       # Create settings.py
       cat <<EOF > /tmp/settings.py
       # Auto-generated settings file
       import secrets
       
+      API_ROOT = "/api/pulp/"
       DB_ENCRYPTION_KEY = "/etc/pulp/keys/database_fields.symmetric.key"
       DATABASES = {
         'default': {
@@ -115,58 +161,125 @@ objects:
           'OPTIONS': { 'sslmode': 'disable' },
         }
       }
+      OTEL_ENABLED = True
       CACHE_ENABLED = True
       REDIS_HOST =  "$(cat /cdapp/cdappconfig.json | jq -r '.inMemoryDb.hostname')"
       REDIS_PORT =  "$(cat /cdapp/cdappconfig.json | jq -r '.inMemoryDb.port')"
       REDIS_PASSWORD = ""
-      AWS_S3_ENDPOINT_URL = "http://${S3_HOSTNAME}:9000"
-      AWS_S3_REGION_NAME = "east"
-      AWS_ACCESS_KEY_ID = '$S3_ACCESS_KEY_ID'
-      AWS_SECRET_ACCESS_KEY = '$S3_SECRET_ACCESS_KEY'
-      AWS_STORAGE_BUCKET_NAME = '$S3_BUCKET_NAME'
-      AWS_DEFAULT_ACL = "@none None"
-      S3_USE_SIGV4 = True
-      AWS_S3_SIGNATURE_VERSION = "s3v4"
-      AWS_S3_ADDRESSING_STYLE = "path"
-      DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
+      STORAGES = {
+          "default": {
+              "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+              "OPTIONS": {
+                  "endpoint_url": "http://${S3_HOSTNAME}:9000",
+                  "region_name": "us-east-1",
+                  "access_key": "$S3_ACCESS_KEY_ID",
+                  "secret_key": "$S3_SECRET_ACCESS_KEY",
+                  "bucket_name": "$S3_BUCKET_NAME",
+                  "default_acl": "@none None",
+                  "signature_version": "s3v4",
+                  "addressing_style": "path",
+              },
+          },
+          "staticfiles": {
+              "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+          },
+      }
       MEDIA_ROOT = ""
       SECRET_KEY = secrets.token_urlsafe(50)
       CONTENT_ORIGIN = "https://$HOST"
+      CONTENT_PATH_PREFIX = "/api/pulp-content/"
       DOMAIN_ENABLED = True
       REDIS_DB = "1"
-      
       EOF
       
       kubectl create secret generic pulp-settings --from-file /tmp/settings.py
-
-      # Create an ingress for the content app
-      kubectl apply -f- <<EOF
-      apiVersion: networking.k8s.io/v1
-      kind: Ingress
+      kubectl apply -f-<<EOF
+      ---
+      apiVersion: route.openshift.io/v1
+      kind: Route
       metadata:
-        name: pulp-content-ingress
-        annotations:
-          route.openshift.io/termination: edge
-          cert-manager.io/cluster-issuer: letsencrypt-http
+        labels:
+          app: pulp
+          pod: pulp-content
+        name: pulp-content
       spec:
-        rules:
-          - host: "${HOST}"
-            http:
-              paths:
-                - path: /pulp/content/
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: pulp-content-svc
-                      port:
-                        number: 24816
+        host: $HOST
+        path: /api/pulp-content
+        port:
+          targetPort: 8000
+        tls:
+          termination: edge
+        to:
+          kind: Service
+          name: pulp-content
+          weight: 100
+        wildcardPolicy: None
+      ---
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        labels:
+          app: pulp
+          pod: pulp-api
+        name: pulp-api
+      spec:
+        host: $HOST
+        path: /api/pulp
+        port:
+          targetPort: 8000
+        tls:
+          termination: edge
+        to:
+          kind: Service
+          name: pulp-api
+          weight: 100
+        wildcardPolicy: None
       EOF
+
+      # Create agent credentials secret
+      cat <<EOF > /tmp/application_default_credentials.json
+      {
+        "account": "",
+        ...
+      }
+      EOF
+      kubectl create secret generic agent-credentials --from-file=service-account-json=/tmp/application_default_credentials.json
+
+
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: migrate-sh-map
+  data:
+    migrate-sh-file: |
+      #!/bin/bash
+      set -e
+      /usr/local/lib/pulp/bin/pulpcore-manager migrate --noinput
+      touch /tmp/migrated
+      while true; do
+        sleep 1d
+      done
+
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: clamav-conf
+  data:
+    clamd.conf: |
+      LogFile /var/log/clamav/clamd.log
+      LogTime yes
+      LocalSocket /tmp/clamd.sock
+      User clamav
+      StreamMaxLength ${CLAMAV_STREAM_MAX_LENGTH}
+      MaxFileSize ${CLAMAV_MAX_FILE_SIZE}
+      MaxScanSize ${CLAMAV_MAX_SCAN_SIZE}
+      TCPSocket ${CLAMAV_TCP_SOCKET}
+      Debug ${CLAMAV_DEBUG}
 
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdApp
   metadata:
     name: pulp
-  #  namespace: "${ENV_NAME}"
   spec:
     envName: "${ENV_NAME}"
     testing:
@@ -174,15 +287,25 @@ objects:
     deployments:
     - name: api
       replicas: ${{PULP_API_REPLICAS}}
+      webServices:
+        public:
+          enabled: true
+          apiPath: pulp
       podSpec:
+        metadata:
+          annotations:
+            "kubectl.kubernetes.io/default-container": pulp-api
         image: ${IMAGE}:${IMAGE_TAG}
-        command: ['/usr/local/bin/opentelemetry-instrument', '--service_name', 'pulp-api', '--exporter_otlp_endpoint', 'pulp-otel-collector-svc:4317', '--exporter_otlp_insecure', 'true', 'pulpcore-api', '--timeout', '90', '--workers', '1', '--access-logfile', '-']
+        command: ['pulpcore-api', '-b', '0.0.0.0:8000', '--timeout', '${PULP_API_GUNICORN_TIMEOUT}', '--max-requests', '${PULP_API_GUNICORN_MAX_REQUESTS}', '--max-requests-jitter', '${PULP_API_GUNICORN_MAX_REQUESTS_JITTER}', '--workers', '${PULP_API_GUNICORN_WORKERS}', '--access-logfile', '-', '--access-logformat', '(pulp [%({correlation-id}o)s]: %(h)s %(l)s user:%({REMOTE_USER}e)s org_id:%({ORG_ID}e)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(M)s x_forwarded_for:"%({X_FORWARDED_FOR}e)s")']
         volumeMounts:
         - name: secret-volume
           mountPath: "/etc/pulp/keys"
         - name: pulp-settings
           mountPath: "/etc/pulp/settings.py"
           subPath: "settings.py"
+        - name: subscription-api-cert-volume
+          mountPath: "/etc/pulp/certs"
+          readOnly: true
         volumes:
           - name: secret-volume
             secret:
@@ -190,6 +313,12 @@ objects:
           - name: pulp-settings
             secret:
               secretName: pulp-settings
+          - name: subscription-api-cert-volume
+            secret:
+              secretName: subscription-api-cert
+              items:
+              - key: ${{PULP_FEATURE_SERVICE_API_CERT}}
+                path: ${{PULP_FEATURE_SERVICE_API_CERT}}
         initContainers:
           - name: wait-on-migrations
             image: ${IMAGE}:${IMAGE_TAG}
@@ -199,17 +328,25 @@ objects:
               - "/usr/bin/wait_on_postgres.py && /usr/bin/wait_on_database_migrations.sh"
             inheritEnv: True
         readinessProbe:
-          exec:
-            command: ["/usr/bin/readyz.py","/pulp/api/v3/status/"]
+          httpGet:
+            path: /api/pulp/api/v3/livez/
+            port: 8000
           initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 10
+          periodSeconds: 60
+          timeoutSeconds: 60
         livenessProbe:
           httpGet:
-            path: /pulp/api/v3/status/
-            port: 24817
-            initialDelaySeconds: 30
-            periodSeconds: 10
+            path: /api/pulp/api/v3/livez/
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 120
+          timeoutSeconds: 120
+        terminationGracePeriodSeconds: 120
+        sidecars:
+          - name: otel-collector
+            enabled: true
+            memoryRequest: ${OTEL_COLLECTOR_MEMORY_REQUEST}
+            memoryLimit: ${OTEL_COLLECTOR_MEMORY_LIMIT}
         resources:
           requests:
             cpu: ${{PULP_API_CPU_REQUEST}}
@@ -217,17 +354,134 @@ objects:
           limits:
             cpu: ${{PULP_API_CPU_LIMIT}}
             memory: ${{PULP_API_MEMORY_LIMIT}}
+        env:
+          - name: GUNICORN_CMD_ARGS
+            value: "--config /usr/bin/log_middleware.py"
+          - name: PULP_OTEL_ENABLED
+            value: ${TELEMETRY_ENABLED}
+          - name: OTEL_EXPORTER_OTLP_PROTOCOL
+            value: ${{OTEL_EXPORTER_OTLP_PROTOCOL}}
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: ${{OTEL_EXPORTER_OTLP_ENDPOINT}}
+          - name: OTEL_METRIC_EXPORT_INTERVAL
+            value: ${OTEL_METRIC_EXPORT_INTERVAL}
+          - name: OTEL_METRIC_EXPORT_TIMEOUT
+            value: ${OTEL_METRIC_EXPORT_TIMEOUT}
+          - name: OTEL_TRACES_EXPORTER
+            value: "none"
+          - name: OTEL_PYTHON_EXCLUDED_URLS
+            value: ${{OTEL_PYTHON_EXCLUDED_URLS}}
+          - name: PULP_OTEL_PULP_API_HISTOGRAM_BUCKETS
+            value: ${PULP_OTEL_PULP_API_HISTOGRAM_BUCKETS}
+          - name: PULP_REDIS_PORT
+            value: "6379"
+          - name: SENTRY_DSN
+            valueFrom:
+              secretKeyRef:
+                name: pulp-glitchtip
+                key: dsn
+                optional: true
+          - name: PULP_API_ROOT
+            value: ${{PULP_API_ROOT}}
+          - name: PULP_DB_ENCRYPTION_KEY
+            value: ${{PULP_DB_ENCRYPTION_KEY}}
+          - name: PULP_ATTESTATION_VERIFICATION_KEY
+            value: ${{PULP_ATTESTATION_VERIFICATION_KEY}}
+          - name: PULP_CACHE_ENABLED
+            value: ${PULP_CACHE_ENABLED}
+          - name: PULP_STORAGES__default__OPTIONS__default_acl
+            value: ${{PULP_AWS_DEFAULT_ACL}}
+          - name: PULP_STORAGES__default__OPTIONS__signature_version
+            value: ${{PULP_AWS_S3_SIGNATURE_VERSION}}
+          - name: PULP_STORAGES__default__OPTIONS__addressing_style
+            value: ${{PULP_AWS_S3_ADDRESSING_STYLE}}
+          - name: PULP_STORAGES__default__BACKEND
+            value: ${{PULP_DEFAULT_FILE_STORAGE}}
+          - name: PULP_MEDIA_ROOT
+            value: ${{PULP_MEDIA_ROOT}}
+          - name: PULP_CONTENT_ORIGIN
+            value: ${{PULP_CONTENT_ORIGIN}}
+          - name: PULP_CONTENT_PATH_PREFIX
+            value: ${{PULP_CONTENT_PATH_PREFIX}}
+          - name: PULP_DOMAIN_ENABLED
+            value: ${PULP_DOMAIN_ENABLED}
+          - name: PULP_REST_FRAMEWORK__DEFAULT_PERMISSION_CLASSES
+            value: ${{PULP_REST_FRAMEWORK__DEFAULT_PERMISSION_CLASSES}}
+          - name: PULP_AUTHENTICATION_BACKENDS
+            value: ${{PULP_AUTHENTICATION_BACKENDS}}
+          - name: PULP_REST_FRAMEWORK__DEFAULT_AUTHENTICATION_CLASSES
+            value: ${{PULP_REST_FRAMEWORK__DEFAULT_AUTHENTICATION_CLASSES}}
+          - name: PULP_AUTHENTICATION_JSON_HEADER
+            value: ${{PULP_AUTHENTICATION_JSON_HEADER}}
+          - name: PULP_AUTHENTICATION_JSON_HEADER_JQ_FILTER
+            value: ${{PULP_AUTHENTICATION_JSON_HEADER_JQ_FILTER}}
+          - name: PULP_AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME
+            value: ${{PULP_AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME}}
+          - name: PULP_ALLOWED_CONTENT_CHECKSUMS
+            value: ${PULP_ALLOWED_CONTENT_CHECKSUMS}
+          - name: PULP_CSRF_TRUSTED_ORIGINS
+            value: ${PULP_CSRF_TRUSTED_ORIGINS}
+          - name: PULP_STATIC_URL
+            value: ${PULP_STATIC_URL}
+          - name: PULP_MIDDLEWARE
+            value: ${PULP_MIDDLEWARE}
+          - name: PULP_PYPI_API_HOSTNAME
+            value: ${{PULP_PYPI_API_HOSTNAME}}
+          - name: PULP_PYPI_PATH_PREFIX
+            value: ${{PULP_PYPI_PATH_PREFIX}}
+          - name: PULP_FEATURE_SERVICE_API_CERT_PATH
+            value: ${{PULP_FEATURE_SERVICE_API_CERT_PATH}}
+          - name: PULP_FEATURE_SERVICE_API_URL
+            value: ${{PULP_FEATURE_SERVICE_API_URL}}
+          - name: PULP_USE_X_FORWARDED_HOST
+            value: ${PULP_USE_X_FORWARDED_HOST}
+          - name: PULP_SECURE_PROXY_SSL_HEADER
+            value: ${PULP_SECURE_PROXY_SSL_HEADER}
+          - name: PULP_TOKEN_AUTH_DISABLED
+            value: ${PULP_TOKEN_AUTH_DISABLED}
+          - name: PULP_TEST_TASK_INGESTION
+            value: ${PULP_TEST_TASK_INGESTION}
+          - name: PULP_AUTHENTICATION_HEADER_DEBUG
+            value: ${PULP_AUTHENTICATION_HEADER_DEBUG}
+          - name: PULP_PYTHON_GROUP_UPLOADS
+            value: ${PULP_PYTHON_GROUP_UPLOADS}
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+          - name: PULP_CLAMAV_HOST
+            value: ${PULP_CLAMAV_SVC_NAME}.$(NAMESPACE).svc
+          - name: PULP_CLAMAV_PORT
+            value: ${PULP_CLAMAV_SVC_PORT}
+          - name: PULP_API_APP_TTL
+            value: ${PULP_API_APP_TTL}
+          - name: PULP_RDS_CONNECTION_TESTS_ENABLED
+            value: ${PULP_RDS_CONNECTION_TESTS_ENABLED}
+          - name: PULP_WORKER_TYPE
+            value: ${PULP_WORKER_TYPE}
+
     - name: content
       replicas: ${{PULP_CONTENT_REPLICAS}}
+      webServices:
+        public:
+          enabled: true
+          apiPath: pulp-content
       podSpec:
+        metadata:
+          annotations:
+            "kubectl.kubernetes.io/default-container": pulp-content
         image: ${IMAGE}:${IMAGE_TAG}
-        command: [ 'pulpcore-content' ]
+        command: ['pulpcore-content', '-b', '0.0.0.0:8000', '--max-requests', '${PULP_CONTENT_GUNICORN_MAX_REQUESTS}', '--max-requests-jitter', '${PULP_CONTENT_GUNICORN_MAX_REQUESTS_JITTER}', '--timeout', '${PULP_CONTENT_GUNICORN_TIMEOUT}', '--graceful-timeout', '${PULP_CONTENT_GUNICORN_GRACEFUL_TIMEOUT}', '--access-logfile', '-', '--access-logformat', '%a %t "%r" %s %b "%{Referer}i" "%{User-Agent}i" cache:"%{X-PULP-CACHE}o" artifact_size:"%{X-PULP-ARTIFACT-SIZE}o" rh_org_id:"%{X-RH-ORG-ID}o" x_forwarded_for:"%{X-Forwarded-For}i"']
         volumeMounts:
           - name: secret-volume
             mountPath: "/etc/pulp/keys"
           - name: pulp-settings
             mountPath: "/etc/pulp/settings.py"
             subPath: "settings.py"
+          - name: subscription-api-cert-volume
+            mountPath: "/etc/pulp/certs"
+            readOnly: true
         volumes:
           - name: secret-volume
             secret:
@@ -235,6 +489,12 @@ objects:
           - name: pulp-settings
             secret:
               secretName: pulp-settings
+          - name: subscription-api-cert-volume
+            secret:
+              secretName: subscription-api-cert
+              items:
+              - key: ${{PULP_FEATURE_SERVICE_API_CERT}}
+                path: ${{PULP_FEATURE_SERVICE_API_CERT}}
         initContainers:
           - name: wait-on-migrations
             image: ${IMAGE}:${IMAGE_TAG}
@@ -244,11 +504,25 @@ objects:
               - "/usr/bin/wait_on_postgres.py && /usr/bin/wait_on_database_migrations.sh"
             inheritEnv: True
         readinessProbe:
-          exec:
-            command: ["/usr/bin/readyz.py", "/pulp/content/default/"]
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 10
+          httpGet:
+            path: /api/pulp-content/default/
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          timeoutSeconds: 60
+        livenessProbe:
+          httpGet:
+            path: /api/pulp-content/default/
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 120
+          timeoutSeconds: 120
+        terminationGracePeriodSeconds: 120
+        sidecars:
+          - name: otel-collector
+            enabled: true
+            memoryRequest: ${OTEL_COLLECTOR_MEMORY_REQUEST}
+            memoryLimit: ${OTEL_COLLECTOR_MEMORY_LIMIT}
         resources:
           requests:
             cpu: ${{PULP_CONTENT_CPU_REQUEST}}
@@ -256,17 +530,86 @@ objects:
           limits:
             cpu: ${{PULP_CONTENT_CPU_LIMIT}}
             memory: ${{PULP_CONTENT_MEMORY_LIMIT}}
+        env:
+          - name: PULP_OTEL_ENABLED
+            value: ${TELEMETRY_ENABLED}
+          - name: OTEL_EXPORTER_OTLP_PROTOCOL
+            value: ${{OTEL_EXPORTER_OTLP_PROTOCOL}}
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: ${{OTEL_EXPORTER_OTLP_ENDPOINT}}
+          - name: OTEL_METRIC_EXPORT_INTERVAL
+            value: ${OTEL_METRIC_EXPORT_INTERVAL}
+          - name: OTEL_METRIC_EXPORT_TIMEOUT
+            value: ${OTEL_METRIC_EXPORT_TIMEOUT}
+          - name: OTEL_TRACES_EXPORTER
+            value: "none"
+          - name: PULP_REDIS_PORT
+            value: "6379"
+          - name: SENTRY_DSN
+            valueFrom:
+              secretKeyRef:
+                name: pulp-glitchtip
+                key: dsn
+                optional: true
+          - name: PULP_API_ROOT
+            value: ${{PULP_API_ROOT}}
+          - name: PULP_DB_ENCRYPTION_KEY
+            value: ${{PULP_DB_ENCRYPTION_KEY}}
+          - name: PULP_ATTESTATION_VERIFICATION_KEY
+            value: ${{PULP_ATTESTATION_VERIFICATION_KEY}}
+          - name: PULP_CACHE_ENABLED
+            value: ${PULP_CACHE_ENABLED}
+          - name: PULP_STORAGES__default__OPTIONS__default_acl
+            value: ${{PULP_AWS_DEFAULT_ACL}}
+          - name: PULP_STORAGES__default__OPTIONS__signature_version
+            value: ${{PULP_AWS_S3_SIGNATURE_VERSION}}
+          - name: PULP_STORAGES__default__OPTIONS__addressing_style
+            value: ${{PULP_AWS_S3_ADDRESSING_STYLE}}
+          - name: PULP_STORAGES__default__BACKEND
+            value: ${{PULP_DEFAULT_FILE_STORAGE}}
+          - name: PULP_MEDIA_ROOT
+            value: ${{PULP_MEDIA_ROOT}}
+          - name: PULP_CONTENT_ORIGIN
+            value: ${{PULP_CONTENT_ORIGIN}}
+          - name: PULP_CONTENT_PATH_PREFIX
+            value: ${{PULP_CONTENT_PATH_PREFIX}}
+          - name: PULP_DOMAIN_ENABLED
+            value: ${PULP_DOMAIN_ENABLED}
+          - name: PULP_ALLOWED_CONTENT_CHECKSUMS
+            value: ${PULP_ALLOWED_CONTENT_CHECKSUMS}
+          - name: PULP_FEATURE_SERVICE_API_CERT_PATH
+            value: ${{PULP_FEATURE_SERVICE_API_CERT_PATH}}
+          - name: PULP_FEATURE_SERVICE_API_URL
+            value: ${{PULP_FEATURE_SERVICE_API_URL}}
+          - name: PULP_TOKEN_AUTH_DISABLED
+            value: ${PULP_TOKEN_AUTH_DISABLED}
+          - name: PULP_UVLOOP_ENABLED
+            value: ${PULP_UVLOOP_ENABLED}
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+          - name: PULP_CLAMAV_HOST
+            value: ${PULP_CLAMAV_SVC_NAME}.$(NAMESPACE).svc
+          - name: PULP_CLAMAV_PORT
+            value: ${PULP_CLAMAV_SVC_PORT}
+          - name: PULP_WORKER_TYPE
+            value: ${PULP_WORKER_TYPE}
+
     - name: worker
       replicas: ${{PULP_WORKER_REPLICAS}}
       podSpec:
         image: ${IMAGE}:${IMAGE_TAG}
-        command: [ 'pulpcore-worker' ]
+        command: ['pulpcore-worker']
         volumeMounts:
           - name: secret-volume
             mountPath: "/etc/pulp/keys"
           - name: pulp-settings
             mountPath: "/etc/pulp/settings.py"
             subPath: "settings.py"
+          - name: agent-credentials
+            mountPath: "/.config/gcloud/"
         volumes:
           - name: secret-volume
             secret:
@@ -274,6 +617,9 @@ objects:
           - name: pulp-settings
             secret:
               secretName: pulp-settings
+          - name: agent-credentials
+            secret:
+              secretName: agent-credentials
         initContainers:
           - name: wait-on-migrations
             image: ${IMAGE}:${IMAGE_TAG}
@@ -285,10 +631,17 @@ objects:
         readinessProbe:
           exec:
             command:
-              - "/usr/bin/wait_on_postgres.py"
-          initialDelaySeconds: 3
-          periodSeconds: 10
-          timeoutSeconds: 10
+              - "/bin/true"
+          initialDelaySeconds: 10
+          periodSeconds: 25
+          timeoutSeconds: 20
+          failureThreshold: 5
+        terminationGracePeriodSeconds: 3660
+        sidecars:
+          - name: otel-collector
+            enabled: ${{PULP_WORKER_OTEL_COLLECTOR_SIDECAR_ENABLED}}
+            memoryRequest: ${OTEL_COLLECTOR_MEMORY_REQUEST}
+            memoryLimit: ${OTEL_COLLECTOR_MEMORY_LIMIT}
         resources:
           requests:
             cpu: ${{PULP_WORKER_CPU_REQUEST}}
@@ -296,69 +649,245 @@ objects:
           limits:
             cpu: ${{PULP_WORKER_CPU_LIMIT}}
             memory: ${{PULP_WORKER_MEMORY_LIMIT}}
-    - name: otel-collector
-      replicas: 1
+        env:
+          - name: PULP_OTEL_ENABLED
+            value: ${TELEMETRY_ENABLED}
+          - name: OTEL_EXPORTER_OTLP_PROTOCOL
+            value: ${{OTEL_EXPORTER_OTLP_PROTOCOL}}
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: ${{OTEL_EXPORTER_OTLP_ENDPOINT}}
+          - name: OTEL_TRACES_EXPORTER
+            value: "none"
+          - name: PULP_REDIS_PORT
+            value: "6379"
+          - name: SENTRY_DSN
+            valueFrom:
+              secretKeyRef:
+                name: pulp-glitchtip
+                key: dsn
+                optional: true
+          - name: PULP_API_ROOT
+            value: ${{PULP_API_ROOT}}
+          - name: PULP_DB_ENCRYPTION_KEY
+            value: ${{PULP_DB_ENCRYPTION_KEY}}
+          - name: PULP_ATTESTATION_VERIFICATION_KEY
+            value: ${{PULP_ATTESTATION_VERIFICATION_KEY}}
+          - name: PULP_CACHE_ENABLED
+            value: ${PULP_CACHE_ENABLED}
+          - name: PULP_STORAGES__default__OPTIONS__default_acl
+            value: ${{PULP_AWS_DEFAULT_ACL}}
+          - name: PULP_STORAGES__default__OPTIONS__signature_version
+            value: ${{PULP_AWS_S3_SIGNATURE_VERSION}}
+          - name: PULP_STORAGES__default__OPTIONS__addressing_style
+            value: ${{PULP_AWS_S3_ADDRESSING_STYLE}}
+          - name: PULP_STORAGES__default__BACKEND
+            value: ${{PULP_DEFAULT_FILE_STORAGE}}
+          - name: PULP_MEDIA_ROOT
+            value: ${{PULP_MEDIA_ROOT}}
+          - name: PULP_CONTENT_ORIGIN
+            value: ${{PULP_CONTENT_ORIGIN}}
+          - name: PULP_CONTENT_PATH_PREFIX
+            value: ${{PULP_CONTENT_PATH_PREFIX}}
+          - name: PULP_DOMAIN_ENABLED
+            value: ${PULP_DOMAIN_ENABLED}
+          - name: PULP_ALLOWED_CONTENT_CHECKSUMS
+            value: ${PULP_ALLOWED_CONTENT_CHECKSUMS}
+          - name: PULP_TASK_PROTECTION_TIME
+            value: ${PULP_TASK_PROTECTION_TIME}
+          - name: PULP_TASK_DIAGNOSTICS
+            value: ${{PULP_TASK_DIAGNOSTICS}}
+          - name: PULP_UPLOAD_PROTECTION_TIME
+            value: ${PULP_UPLOAD_PROTECTION_TIME}
+          - name: PULP_MAX_CONCURRENT_CONTENT
+            value: ${PULP_MAX_CONCURRENT_CONTENT}
+          - name: PULP_WORKER_TYPE
+            value: ${PULP_WORKER_TYPE}
+          - name: ANTHROPIC_VERTEX_PROJECT_ID
+            value: ${ANTHROPIC_VERTEX_PROJECT_ID}
+      autoScaler:
+        minReplicaCount: ${{PULP_WORKER_MIN_REPLICA_COUNT}}
+        maxReplicaCount: ${{PULP_WORKER_MAX_REPLICA_COUNT}}
+        pollingInterval: 10
+        # externalHPA: true
+        triggers:
+          - type: prometheus
+            metadata:
+              serverAddress: http://prometheus-app-sre.openshift-customer-monitoring.svc.cluster.local:9090
+              metricName: pulp_waiting_tasks
+              query: clamp_min(pulp_waiting_tasks and on(pod) topk(1, max(timestamp(pulp_waiting_tasks)) by (pod)), 0)
+              threshold: '1'
+            metricType: Value
+        advanced:
+          horizontalPodAutoscalerConfig:
+            behavior:
+              scaleDown:
+                stabilizationWindowSeconds: 300
+                policies:
+                  - type: Pods
+                    value: 2
+                    periodSeconds: 60
+              scaleUp:
+                policies:
+                  - type: Pods
+                    value: 5
+                    periodSeconds: 30
+
+    - name: clamav
+      replicas: ${{CLAMAV_REPLICAS}}
+      webServices:
+        private:
+          appProtocol: tcp
+          enabled: true
       podSpec:
-        image: "quay.io/cloudservices/opentelemetry-collector"
+        metadata:
+          annotations:
+            ignore-check.kube-linter.io/minimum-three-replicas: "ClamAV is a low-requirement and must run with just one replica."
+        image: ${CLAMAV_IMAGE}:${CLAMAV_IMAGE_TAG}
+        command:
+          - /bin/sh
         args:
-         - "--config"
-         - "file:/etc/otelcol-contrib/otel-collector-config.yaml"
-        volumes:
-          - name: otel-config
-            configMap:
-              name: pulp-otel-collector-config
-        volumeMounts:
-          - name: otel-config
-            mountPath: /etc/otelcol-contrib/otel-collector-config.yaml
-            subPath: otel-collector-config
+          - -c
+          - /init-unprivileged  
+        env:
+          - name: CLAMD_CONF_StreamMaxLength
+            value: ${CLAMAV_STREAM_MAX_LENGTH}
+          - name: CLAMD_CONF_MaxFileSize
+            value: ${CLAMAV_MAX_FILE_SIZE}
+          - name: CLAMD_CONF_MaxScanSize
+            value: ${CLAMAV_MAX_SCAN_SIZE}
+          - name: CLAMD_CONF_TCPSocket
+            value: ${CLAMAV_TCP_SOCKET}
+        readinessProbe:
+          exec:
+            command:
+              - clamdscan
+              - "--ping"
+              - "1"
+          initialDelaySeconds: 20
+          periodSeconds: 25
+          timeoutSeconds: 20
+          failureThreshold: 5
+        livenessProbe:
+          exec:
+            command:
+              - clamdscan
+              - "--ping"
+              - "1"
+          initialDelaySeconds: 20
+          periodSeconds: 25
+          timeoutSeconds: 20
+          failureThreshold: 5
         resources:
           requests:
-            cpu: ${{OTEL_COLLECTOR_CPU_REQUEST}}
-            memory: ${{OTEL_COLLECTOR_MEMORY_REQUEST}}
+            cpu: ${{CLAMAV_CPU_REQUEST}}
+            memory: ${{CLAMAV_MEMORY_REQUEST}}
           limits:
-            cpu: ${{OTEL_COLLECTOR_CPU_LIMIT}}
-            memory: ${{OTEL_COLLECTOR_MEMORY_LIMIT}}
+            cpu: ${{CLAMAV_CPU_LIMIT}}
+            memory: ${{CLAMAV_MEMORY_LIMIT}}
+        volumes:
+          - name: lib
+            emptyDir: {}
+          - name: log
+            emptyDir: {}
+          - name: clamav-conf
+            configMap:
+              name: clamav-conf
+        volumeMounts:
+          - name: lib
+            mountPath: /var/lib/clamav
+          - name: log
+            mountPath: /var/log/clamav
+          - name: clamav-conf
+            mountPath: /etc/clamav/clamd.conf
+            subPath: clamd.conf
+
+    - name: migrate-db
+      replicas: ${{PULP_MIGRATION_REPLICAS}}
+      podSpec:
+        image: ${IMAGE}:${IMAGE_TAG}
+        command: [ 'bash', '-x', '/tmp/migrate.sh' ]
+        volumeMounts:
+          - name: migrate-sh
+            mountPath: /tmp/migrate.sh
+            subPath: migrate-sh-file
+          - name: secret-volume
+            mountPath: "/etc/pulp/keys"
+          - name: pulp-settings
+            mountPath: "/etc/pulp/settings.py"
+            subPath: "settings.py"
+        volumes:
+          - name: migrate-sh
+            configMap:
+              name: migrate-sh-map
+          - name: secret-volume
+            secret:
+              secretName: pulp-db-fields-encryption
+          - name: pulp-settings
+            secret:
+              secretName: pulp-settings
+        initContainers:
+          - name: wait-on-postgres
+            image: ${IMAGE}:${IMAGE_TAG}
+            command: [ "/usr/bin/wait_on_postgres.py" ]
+            inheritEnv: True
+        readinessProbe:
+          exec:
+            command: ["stat", "/tmp/migrated"]
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          timeoutSeconds: 10
+        resources:
+          requests:
+            cpu: ${{PULP_MIGRATE_DB_CPU_REQUEST}}
+            memory: ${{PULP_MIGRATE_DB_MEMORY_REQUEST}}
+          limits:
+            cpu: ${{PULP_MIGRATE_DB_CPU_LIMIT}}
+            memory: ${{PULP_MIGRATE_DB_MEMORY_LIMIT}}
+        env:
+          - name: PULP_CONTENT_ORIGIN
+            value: ${{PULP_CONTENT_ORIGIN}}
+          - name: PULP_DB_ENCRYPTION_KEY
+            value: ${{PULP_DB_ENCRYPTION_KEY}}
+          - name: SENTRY_DSN
+            valueFrom:
+              secretKeyRef:
+                name: pulp-glitchtip
+                key: dsn
+                optional: true
+          - name: PULP_ALLOWED_CONTENT_CHECKSUMS
+            value: ${PULP_ALLOWED_CONTENT_CHECKSUMS}
+
     database:
       name: pulp
       version: 15
     inMemoryDb: true
     objectStore:
-      - pulp-s3
+      - ${{OBJECT_STORE_NAME}}
     jobs:
       - name: create-settings-and-ingress
         podSpec:
-          image: "quay.io/openshift/origin-cli:latest"
+          image: ${IMAGE}:${IMAGE_TAG}
           command: [ 'bash', '-x', '/tmp/config.sh' ]
           volumes:
             - name: config-sh
               configMap:
-                name: cs-config-sh-map
+                name: config-sh-map
           volumeMounts:
             - name: config-sh
               mountPath: /tmp/config.sh
               subPath: config-sh-file
-      - name: migrate-db
-        podSpec:
-          image: ${IMAGE}:${IMAGE_TAG}
-          command: [ '/usr/local/bin/pulpcore-manager', 'migrate', '--noinput' ]
-          volumeMounts:
-            - name: secret-volume
-              mountPath: "/etc/pulp/keys"
-            - name: pulp-settings
-              mountPath: "/etc/pulp/settings.py"
-              subPath: "settings.py"
-          volumes:
-            - name: secret-volume
-              secret:
-                secretName: pulp-db-fields-encryption
-            - name: pulp-settings
-              secret:
-                secretName: pulp-settings
+          resources:
+            requests:
+              memory: 192Mi
+              cpu: 250m
+            limits:
+              memory: 384Mi
+              cpu: 500m
       - name: reset-admin-password
         podSpec:
           image: ${IMAGE}:${IMAGE_TAG}
           command: [ '/bin/sh' ]
-          args: ['-c', '/usr/local/bin/pulpcore-manager reset-admin-password --password "$PULP_ADMIN_PASSWORD"' ]
+          args: ['-c', '/usr/local/lib/pulp/bin/pulpcore-manager reset-admin-password --password "$PULP_ADMIN_PASSWORD"' ]
           env:
             - name: PULP_ADMIN_PASSWORD
               valueFrom:
@@ -366,6 +895,8 @@ objects:
                   name: pulp-admin-password
                   key: password
                   optional: true
+            - name: PULP_CONTENT_ORIGIN
+              value: ${{PULP_CONTENT_ORIGIN}}
           volumeMounts:
             - name: secret-volume
               mountPath: "/etc/pulp/keys"
@@ -379,84 +910,247 @@ objects:
             - name: pulp-settings
               secret:
                 secretName: pulp-settings
-- apiVersion: v1
-  kind: Service
-  metadata:
-    labels:
-      app: pulp-api
-    name: pulp-api-svc
-  spec:
-    ports:
-      - name: api-24817
-        protocol: TCP
-        port: 24817
-        targetPort: 24817
-    selector:
-      pod: pulp-api
-    sessionAffinity: None
-    type: ClusterIP
-  status:
-    loadBalancer: {}
-- apiVersion: v1
-  kind: Service
-  metadata:
-    labels:
-      app: pulp-content
-    name: pulp-content-svc
-  spec:
-    ports:
-      - name: content-24816
-        protocol: TCP
-        port: 24816
-        targetPort: 24816
-    selector:
-      pod: pulp-content
-    sessionAffinity: None
-    type: ClusterIP
-  status:
-    loadBalancer: {}
-- apiVersion: v1
-  kind: Service
-  metadata:
-    labels:
-      otel: ""
-      pulp_cr: pulp
-    name: pulp-otel-collector-svc
-  spec:
-    ports:
-      - name: otel-8889
-        protocol: TCP
-        port: 8889
-        targetPort: 8889
-      - name: otel-4317
-        protocol: TCP
-        port: 4317
-        targetPort: 4317
-      - name: otel-4318
-        protocol: TCP
-        port: 4318
-        targetPort: 4318
-    selector:
-      pod: pulp-otel-collector
-    sessionAffinity: None
-    type: ClusterIP
-  status:
-    loadBalancer: {}
+      - name: create-contentsources-user
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command: [ 'pulpcore-manager' ]
+          args:
+            - "shell"
+            - "-c"
+            - |
+              from os import getenv
+              from django.contrib.auth import get_user_model
+              User = get_user_model()
+              user, created = User.objects.get_or_create(username='contentsources')
+              password = getenv("CONTENT_SOURCES_PASSWORD")
+              user.set_password(password)
+              user.is_superuser = False
+              user.save()
+          volumeMounts:
+            - name: secret-volume
+              mountPath: "/etc/pulp/keys"
+            - name: pulp-settings
+              mountPath: "/etc/pulp/settings.py"
+              subPath: "settings.py"
+          volumes:
+            - name: secret-volume
+              secret:
+                secretName: pulp-db-fields-encryption
+            - name: pulp-settings
+              secret:
+                secretName: pulp-settings
+          env:
+            - name: CONTENT_SOURCES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-content-sources-password
+                  key: password
+                  optional: false
+            - name: XDG_CONFIG_HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp"
+
+      - name: add-new-pulp-admin-users-3
+        podSpec:
+          image: ${IMAGE}:${IMAGE_TAG}
+          command: [ 'pulpcore-manager' ]
+          args:
+            - "shell"
+            - "-c"
+            - |
+              from os import getenv
+              from django.contrib.auth import get_user_model
+
+              admin_list = ["bmbouter@redhat.com", "dkliban@redhat.com", "hyagi@redhat.com", "ytrahnov@redhat.com", "ddebrito@redhat.com"]
+
+              User = get_user_model()
+              for user in admin_list:
+                  user, created = User.objects.get_or_create(username=user)
+                  user.is_superuser = True
+                  user.save()
+          volumeMounts:
+            - name: secret-volume
+              mountPath: "/etc/pulp/keys"
+            - name: pulp-settings
+              mountPath: "/etc/pulp/settings.py"
+              subPath: "settings.py"
+          volumes:
+            - name: secret-volume
+              secret:
+                secretName: pulp-db-fields-encryption
+            - name: pulp-settings
+              secret:
+                secretName: pulp-settings
+          env:
+            - name: PULP_DB_ENCRYPTION_KEY
+              value: ${{PULP_DB_ENCRYPTION_KEY}}
+            - name: XDG_CONFIG_HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp"
+
+      - name: export-access-logs-v3
+        schedule: "15 * * * *"
+        restartPolicy: Never
+        concurrencyPolicy: Forbid
+        podSpec:
+          image: registry.access.redhat.com/ubi9/python-312:latest
+          command: ['/bin/bash', '-c']
+          args:
+            - |
+              # Only run on pulp* worker clusters (stage + prod)
+              if [[ "${CLUSTER_NAME}" != pulp* ]]; then
+                echo "Skipping: CLUSTER_NAME='${CLUSTER_NAME}' is not a pulp* cluster"
+                exit 0
+              fi
+
+              if [[ -z "${CLOUDWATCH_LOG_GROUP}" || -z "${S3_BUCKET_NAME}" || -z "${PULP_PYPI_HOST}" ]]; then
+                echo "Skipping: required parameters not configured (CLOUDWATCH_LOG_GROUP, S3_BUCKET_NAME, PULP_PYPI_HOST)"
+                exit 0
+              fi
+
+              TIMESTAMP=$(date -u -d '1 hour ago' '+%Y%m%dT%H0000Z')
+              LOCAL_FILE="/tmp/pulp_access_logs_${TIMESTAMP}.parquet"
+
+              # Install tools
+              pip install uv
+              export UV_INDEX="${PULP_PYPI_HOST/https:\/\//https://${PYPI_USERNAME}:${PYPI_PASSWORD}@}"
+              uv pip install pulp-access-logs-exporter
+
+              export PATH=${PATH}:/tmp/bin
+              mkdir -p /tmp/bin
+              curl -L https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64 -o /tmp/bin/jq
+              chmod +x /tmp/bin/jq
+
+              # 1. Query CloudWatch and write to local file
+              START_TIME=$(date -u -d '1 hour ago' '+%Y-%m-%dT%H:00:00Z')
+              END_TIME=$(date -u -d '1 hour ago' '+%Y-%m-%dT%H:59:59Z')
+              export-access-logs \
+                --cloudwatch-group "${CLOUDWATCH_LOG_GROUP}" \
+                --start-time "${START_TIME}" \
+                --end-time "${END_TIME}" \
+                --output-path "${LOCAL_FILE}" \
+                --aws-region "${AWS_REGION}"
+
+              # Skip uploads if no data was exported
+              if [ ! -f "${LOCAL_FILE}" ]; then
+                echo "No data exported — skipping uploads."
+                exit 0
+              fi
+
+              # 2. Upload to dataverse S3 bucket
+              upload-parquet \
+                --source "${LOCAL_FILE}" \
+                --destination "s3://${S3_BUCKET_NAME%/}/${S3_BUCKET_PREFIX#/}/pulp_access_logs_${TIMESTAMP}.parquet" \
+                --s3-access-key-id "${S3_ACCESS_KEY_ID}" \
+                --s3-secret-access-key "${S3_SECRET_ACCESS_KEY}"
+
+              # 3. Upload to pulp-dataverse-s3 bucket (redundancy)
+              if [ -n "${BACKUP_S3_ACCESS_KEY_ID:-}" ]; then
+                upload-parquet \
+                  --source "${LOCAL_FILE}" \
+                  --destination "s3://${BACKUP_S3_BUCKET_NAME}/pulp_access_logs_${TIMESTAMP}.parquet" \
+                  --s3-access-key-id "${BACKUP_S3_ACCESS_KEY_ID}" \
+                  --s3-secret-access-key "${BACKUP_S3_SECRET_ACCESS_KEY}"
+              fi
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cloudwatch-pulp-log-access-read-only
+                  key: aws_access_key_id
+                  optional: false
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cloudwatch-pulp-log-access-read-only
+                  key: aws_secret_access_key
+                  optional: false
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: cloudwatch-pulp-log-access-read-only
+                  key: aws_region
+                  optional: false
+            - name: CLUSTER_NAME
+              value: ${{CLUSTER_NAME}}
+            - name: ENV_NAME
+              value: ${{ENV_NAME}}
+            - name: BACKUP_S3_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-dataverse-s3
+                  key: bucket
+                  optional: false
+            - name: BACKUP_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-dataverse-s3
+                  key: aws_access_key_id
+                  optional: false
+            - name: BACKUP_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pulp-dataverse-s3
+                  key: aws_secret_access_key
+                  optional: false
+            - name: CLOUDWATCH_LOG_GROUP
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: cloudwatch_log_group
+                  optional: false
+            - name: S3_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: bucket
+                  optional: false
+            - name: S3_BUCKET_PREFIX
+              value: data
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: s3_access_key_id
+                  optional: false
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: s3_secret_access_key
+                  optional: false
+            - name: PULP_PYPI_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: pulp_pypi_url
+                  optional: false
+            - name: PYPI_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: pypi_username
+                  optional: false
+            - name: PYPI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dataverse
+                  key: pypi_password
+                  optional: false
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
 - apiVersion: cloud.redhat.com/v1alpha1
   kind: ClowdJobInvocation
   metadata:
-    labels:
-      app: pulp
-    name: migrations-12-14-2023
-  spec:
-    appName: pulp
-    runOnNotReady: True
-    jobs:
-      - migrate-db
-- apiVersion: cloud.redhat.com/v1alpha1
-  kind: ClowdJobInvocation
-  metadata:
-    name: reset-admin-password
+    name: reset-admin-password-1
   spec:
     appName: pulp
     jobs:
@@ -470,13 +1164,30 @@ objects:
     runOnNotReady: True
     jobs:
       - create-settings-and-ingress
+- apiVersion: cloud.redhat.com/v1alpha1
+  kind: ClowdJobInvocation
+  metadata:
+    name: create-contentsources-user
+  spec:
+    appName: pulp
+    jobs:
+      - create-contentsources-user
+- apiVersion: cloud.redhat.com/v1alpha1
+  kind: ClowdJobInvocation
+  metadata:
+    name: add-new-pulp-admin-users-3
+  spec:
+    appName: pulp
+    jobs:
+      - add-new-pulp-admin-users-3
+
 parameters:
   - name: ENV_NAME
     description: Specify your (ephemeral) namespace
     required: true
   - name: IMAGE
     description: Specify which container image the operator will deploy as Pulp services.
-    value: quay.io/cloudservices/pulp-ubi
+    value: quay.io/redhat-services-prod/pulp-services-tenant/pulp
   - name: IMAGE_TAG
     description: Specify the tag or hash for the image deployed by the operator.
     value: latest
@@ -491,13 +1202,34 @@ parameters:
     value: "0" # setting to 0 because we are using an ingress as a reverse proxy
   - name: PULP_WORKER_REPLICAS
     description: Number of pulp workers
-    value: "1"
+    value: "3"
+  - name: PULP_WORKER_MIN_REPLICA_COUNT
+    description: Minimal number of pulp workers
+    value: "3"
+  - name: PULP_WORKER_MAX_REPLICA_COUNT
+    description: Maximum number of pulp workers
+    value: "20"
   - name: PULP_CONTENT_REPLICAS
     description: Number of pulp content replicas
     value: "1"
+  - name: PULP_MIGRATION_REPLICAS
+    description: Number of pulp migration replicas. This is a workaround to be able to deploy the migration pods only in one of the clusters.
+    value: "1"
+  - name: PULP_MIGRATE_DB_CPU_REQUEST
+    description: Amount of CPU to request for the migrate-db pods
+    value: "150m"
+  - name: PULP_MIGRATE_DB_CPU_LIMIT
+    description: Limit of CPU use by migrate-db pods
+    value: "300m"
+  - name: PULP_MIGRATE_DB_MEMORY_REQUEST
+    description: Amount of memory to request for migrate-db pods
+    value: "512Mi"
+  - name: PULP_MIGRATE_DB_MEMORY_LIMIT
+    description: Limit of memory use by migrate-db pods
+    value: "1024Mi"
   - name: PULP_API_CPU_REQUEST
     description: Amount of CPU to request for the API pods
-    value: "250m"
+    value: "500m"
   - name: PULP_CONTENT_CPU_REQUEST
     description: Amount of CPU to request for the Content pods
     value: "250m"
@@ -506,7 +1238,7 @@ parameters:
     value: "250m"
   - name: PULP_API_CPU_LIMIT
     description: Limit of CPU use by API pods
-    value: "500m"
+    value: "1000m"
   - name: PULP_CONTENT_CPU_LIMIT
     description: Limit of CPU use by Content pods
     value: "500m"
@@ -521,7 +1253,7 @@ parameters:
     value: "256Mi"
   - name: PULP_WORKER_MEMORY_REQUEST
     description: Amount of memory to request for Worker pods
-    value: "256Mi"
+    value: "1024Mi"
   - name: PULP_API_MEMORY_LIMIT
     description: Limit of memory use by API pods
     value: "512Mi"
@@ -530,7 +1262,25 @@ parameters:
     value: "512Mi"
   - name: PULP_WORKER_MEMORY_LIMIT
     description: Limit of memory use by Worker pods
-    value: "512Mi"
+    value: "2048Mi"
+  - name: PULP_WORKER_OTEL_COLLECTOR_SIDECAR_ENABLED
+    description: Enable the OTel collector sidecar
+    value: "true"
+  - name: TELEMETRY_ENABLED
+    description: Enables the application to send telemetry data.
+    value: "true"
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    description: Defines the protocol used to feed the OpenTelemetry collector.
+    value: "http/protobuf"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    description: The collector endpoint used to receive telemetry data from the application.
+    value: "http://localhost:10000/"
+  - name: OTEL_METRIC_EXPORT_INTERVAL
+    description: The time interval (in milliseconds) between the start of two export attempts.
+    value: "7000"
+  - name: OTEL_METRIC_EXPORT_TIMEOUT
+    description: Maximum allowed time (in milliseconds) to export data.
+    value: "7000"
   - name: OTEL_COLLECTOR_CPU_REQUEST
     description: Amount of CPU to request for OpenTelemetry Collector container
     value: "250m"
@@ -541,11 +1291,212 @@ parameters:
     description: Amount of memory to request for OpenTelemetry Collector container
     value: "256Mi"
   - name: OTEL_COLLECTOR_MEMORY_LIMIT
-    description: Limit of memory use by OpenTelemetry Collector contaienr
-    value: "512Mi"
+    description: Limit of memory use by OpenTelemetry Collector container
+    value: "384Mi"
+  - name: OTEL_PYTHON_EXCLUDED_URLS
+    description: RegEx used to exclude URLs from the OTEL metrics system
+    value: ".*livez,.*status"
+  - name: PULP_OTEL_PULP_API_HISTOGRAM_BUCKETS
+    description: A list of float values for API request duration bucket boundaries.
+    value: "[500.0,750.0,1000.0,2500.0,3000.0,5000.0]"
   - name: DB_SECRET_NAME
     description: Name of the secret with external database information for the operator.
     value: "pulp-external-database"
   - name: CONTENT_ORIGIN
     description: The value for the CONTENT_ORIGIN pulp setting
-    value: http://pulp-content-svc.local
+    value: http://pulp-content.local
+  - name: OBJECT_STORE_NAME
+    description: The name of the S3 bucket.
+    value: pulp-default-domain-s3
+  - name: PULP_AUTHENTICATION_BACKENDS
+    description: The AUTHENTICATION_BACKENDS to be used by Pulp.
+    value: "@merge ['django.contrib.auth.backends.RemoteUserBackend','pulp_service.app.authentication.RHSamlAuthentication']"
+  - name: PULP_REST_FRAMEWORK__DEFAULT_AUTHENTICATION_CLASSES
+    description: The default authentication classes for Pulp.
+    value: "['pulp_service.app.authentication.RHServiceAccountCertAuthentication','rest_framework.authentication.BasicAuthentication','rest_framework.authentication.SessionAuthentication','pulp_service.app.authentication.RHTermsBasedRegistryAuthentication']"
+  - name: PULP_REST_FRAMEWORK__DEFAULT_PERMISSION_CLASSES
+    description: The default permission classes for the REST API
+    value: "['pulp_service.app.authorization.DomainBasedPermission']"
+  - name: PULP_AUTHENTICATION_JSON_HEADER
+    description: The name of the header where Authentication information is found.
+    value: "HTTP_X_RH_IDENTITY"
+  - name: PULP_AUTHENTICATION_JSON_HEADER_JQ_FILTER
+    description: The JQ filter used to filter authentication info.
+    value: ".identity.user.username"
+  - name: PULP_AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME
+    description: The security scheme to be send to external clients to authenticate on api gateway.
+    value: >
+      '@json {"type": "oauth2", "description": "External OAuth2 integration", "flows": { "clientCredentials": { "tokenUrl": "https://sso.stage.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", "scopes": {"api.console": "grant_access_to_pulp"}}}}'
+  - name: PULP_API_ROOT
+    description: The root path to the API
+    value: "/api/pulp/"
+  - name: PULP_DB_ENCRYPTION_KEY
+    description: Path to DB encryption key
+    value: "/etc/pulp/keys/database_fields.symmetric.key"
+  - name: PULP_ATTESTATION_VERIFICATION_KEY
+    description: Path to attestation verification key
+    value: "/etc/pki/sigstore/SIGSTORE-redhat-release3"
+  - name: PULP_CACHE_ENABLED
+    description: Enable CACHE. Need REDIS installed.
+    value: "true"
+  - name: PULP_AWS_DEFAULT_ACL
+    description: AWS default ACL
+    value: "@none None"
+  - name: PULP_AWS_S3_SIGNATURE_VERSION
+    description: S3 Signature version
+    value: "s3v4"
+  - name: PULP_AWS_S3_ADDRESSING_STYLE
+    description: S3 Addressing style
+    value: "path"
+  - name: PULP_DEFAULT_FILE_STORAGE
+    description: Pulp default file storage
+    value: "storages.backends.s3boto3.S3Boto3Storage"
+  - name: PULP_MEDIA_ROOT
+    description: Pulp media root
+    value: ""
+  - name: PULP_CONTENT_ORIGIN
+    description: Content Origin
+    value: "http://pulp-content:8000"
+  - name: PULP_CONTENT_PATH_PREFIX
+    description: Content Path Prefix
+    value: "/api/pulp-content/"
+  - name: PULP_DOMAIN_ENABLED
+    description: Domain Enabled
+    value: "true"
+  - name: PULP_ALLOWED_CONTENT_CHECKSUMS
+    description: Checksums that Pulp can use to validate packages.
+    value: "[\"sha224\", \"sha256\", \"sha384\", \"sha512\"]"
+  - name: PULP_API_GUNICORN_TIMEOUT
+    description: Workers silent for more than this many seconds are killed and restarted.
+    value: "1800"
+  - name: PULP_API_GUNICORN_WORKERS
+    description: Number of gunicorn workers in the API pods
+    value: "1"
+  - name: PULP_API_GUNICORN_MAX_REQUESTS
+    description: The maximum number of requests an API worker will process before restarting.
+    value: "20"
+  - name: PULP_API_GUNICORN_MAX_REQUESTS_JITTER
+    description: The maximum jitter to add to the API max_requests setting for each worker.
+    value: "5"
+  - name: PULP_CONTENT_GUNICORN_MAX_REQUESTS
+    description: The maximum number of requests a content worker will process before restarting.
+    value: "20"
+  - name: PULP_CONTENT_GUNICORN_MAX_REQUESTS_JITTER
+    description: The maximum jitter to add to the Content max_requests setting for each worker.
+    value: "5"
+  - name: PULP_CONTENT_GUNICORN_TIMEOUT
+    description: Workers silent for more than this many seconds are killed and restarted.
+    value: "90"
+  - name: PULP_CONTENT_GUNICORN_GRACEFUL_TIMEOUT
+    description: Timeout for graceful gunicorn workers restart.
+    value: "300"
+  - name: PULP_CSRF_TRUSTED_ORIGINS
+    value: "['https://*.apps.crc-eph.r9lp.p1.openshiftapps.com']"
+  - name: PULP_STATIC_URL
+    description: The path to the static assets needed by some Django apps
+    value: "/api/pulp/assets/"
+  - name: PULP_MIDDLEWARE
+    description: List of Middleware
+    value: "@merge ['pulp_service.app.middleware.TrueClientIPMiddleware', 'pulp_service.app.middleware.RequestPathMiddleware', 'pulp_service.app.middleware.ActiveConnectionsMetricMiddleware', 'pulp_service.app.middleware.ProfilerMiddleware', 'pulp_service.app.middleware.RhEdgeHostMiddleware', 'pulp_service.app.middleware.RHSamlAuthHeaderMiddleware']"
+  - name: PULP_PYPI_API_HOSTNAME
+    description: The hostname used to form the distribution's `base_url`.
+    value: "http://pulp-content:8000"
+  - name: PULP_PYPI_PATH_PREFIX
+    description: The path prefix for PyPI API endpoints.
+    value: "/api/pypi/"
+  - name: PULP_SECURE_PROXY_SSL_HEADER
+    description: Check for the correct url scheme to use when building URLs
+    value: "['HTTP_X_FORWARDED_PROTO', 'https']"
+  - name: PULP_USE_X_FORWARDED_HOST
+    description: Use the x-forwarded-host value to build absolute urls
+    value: "true"
+  - name: PULP_TOKEN_AUTH_DISABLED
+    description: Disable token authentication for the Container registry
+    value: "true"
+  - name: PULP_UVLOOP_ENABLED
+    description: Enable the UVLoopWorker for gunicorn.
+    value: "false"
+  - name: PULP_TEST_TASK_INGESTION
+    description: Enable the Task Ingestion test endpoint
+    value: "false"
+  - name: PULP_AUTHENTICATION_HEADER_DEBUG
+    description: Enable the debug authentication headers endpoint
+    value: "false"
+  - name: PULP_FEATURE_SERVICE_API_CERT_PATH
+    value: "/etc/pulp/certs/pulp-services-non-prod.pem"
+  - name: PULP_FEATURE_SERVICE_API_CERT
+    value: "pulp-services-non-prod.pem"
+  - name: PULP_FEATURE_SERVICE_API_URL
+    description: FeatureServices API URL to list the features from an owner
+    value: "https://feature.stage.api.redhat.com/features/v2/featureStatus"
+  - name: PULP_TASK_PROTECTION_TIME
+    description: Set the time in minutes to purge tasks
+    value: "20160"
+  - name: PULP_PYTHON_GROUP_UPLOADS
+    description: Enable group uploads for Python packages
+    value: "true"
+  - name: PULP_TASK_DIAGNOSTICS
+    description: List of profilers available for task diagnostics
+    value: "['memory', 'memray', 'pyinstrument']"
+  - name: CLAMAV_REPLICAS
+    description: Number of ClamAV replicas 
+    value: "1"
+  - name: CLAMAV_IMAGE
+    description: Specify which ClamAV container image the operator will deploy.
+    value: docker.io/clamav/clamav
+  - name: CLAMAV_IMAGE_TAG
+    description: Specify the tag or hash for the ClamAV image deployed by the operator.
+    value: "1.5.1"
+  - name: CLAMAV_STREAM_MAX_LENGTH
+    description: This option allows you to specify the upper limit for data size that will be transfered to remote daemon when scanning a single file.
+    value: 2G
+  - name: CLAMAV_MAX_FILE_SIZE
+    description: Files larger than this limit won't be scanned.
+    value: 2G
+  - name: CLAMAV_MAX_SCAN_SIZE
+    description: Sets the maximum amount of data to be scanned for each input file.
+    value: 2G
+  - name: CLAMAV_CPU_REQUEST
+    description: Amount of CPU to request for ClamAV container
+    value: "1"
+  - name: CLAMAV_MEMORY_REQUEST
+    description: Amount of memory to request for ClamAV container
+    value: 3Gi
+  - name: CLAMAV_CPU_LIMIT
+    description: Limit of CPU use by ClamAV container
+    value: "2"
+  - name: CLAMAV_MEMORY_LIMIT
+    description: Limit of memory use by ClamAV container
+    value: 4Gi
+  - name: CLAMAV_TCP_SOCKET
+    description: TCP port number the daemon will listen on. DO NOT MODIFY THIS. As of now, it seems like clowder only accepts/configures port 10000 for the "private services".
+    value: "10000"
+  - name: PULP_CLAMAV_SVC_NAME
+    description: ClamAV service name. This variable will be used by Pulp to define the TCP host to connect to ClamAV.
+    value: pulp-clamav
+  - name: PULP_CLAMAV_SVC_PORT
+    description: ClamAV service port. This variable will be used by Pulp to define the TCP port to connect to ClamAV.
+    value: "10000"
+  - name: CLAMAV_DEBUG
+    description: Enable debug messages from libclamav.
+    value: "false"
+  - name: PULP_UPLOAD_PROTECTION_TIME
+    description: Enable uploads cleanup after some period, in minutes.
+    value: "480"
+  - name: PULP_API_APP_TTL
+    value: "120"
+  - name: PULP_MAX_CONCURRENT_CONTENT
+    description: The size of the batch of content processed in one go when syncing content from a remote.
+    value: "200"
+  - name: PULP_RDS_CONNECTION_TESTS_ENABLED
+    description: Enable RDS Connection tests endpoints.
+    value: "false"
+  - name: PULP_WORKER_TYPE
+    description: Worker implementation type (pulpcore or redis).
+    value: "redis"
+  - name: CLUSTER_NAME
+    description: Cluster identifier for the deployment (e.g. crcs02ue1, crcp01ue1)
+    required: false
+  - name: ANTHROPIC_VERTEX_PROJECT_ID
+    description: PROJECT ID used by agents to authenticate to Vertex AI
+    value: "test-project"

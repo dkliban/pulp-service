@@ -1,5 +1,13 @@
-FROM registry.access.redhat.com/ubi8/ubi
+# build agent
+FROM registry.access.redhat.com/ubi9/go-toolset:9.7 AS builder
 
+COPY images/assets/agent-scan .
+RUN go mod download
+RUN CGO_ENABLED=0 go build -o agent-scan .
+
+# build pulp image
+FROM registry.access.redhat.com/ubi9/ubi
+ARG PYTHON_VERSION=3.11
 ENV PYTHONUNBUFFERED=0
 ENV DJANGO_SETTINGS_MODULE=pulpcore.app.settings
 ENV PULP_SETTINGS=/etc/pulp/settings.py
@@ -10,21 +18,19 @@ ENV PULP_API_WORKERS=${PULP_API_WORKERS:-2}
 ENV PULP_CONTENT_WORKERS=${PULP_CONTENT_WORKERS:-2}
 
 ENV PULP_GUNICORN_RELOAD=${PULP_GUNICORN_RELOAD:-false}
-ENV PULP_OTEL_ENABLED=${PULP_OTEL_ENABLED:-false}
 ENV PULP_WORKERS=2
 ENV PULP_HTTPS=false
 ENV PULP_STATIC_ROOT=/var/lib/operator/static/
 
+
 # Install updates & dnf plugins before disabling python36 to prevent errors
-COPY images/repos.d/*.repo /etc/yum.repos.d/
+# COPY images/repos.d/*.repo /etc/yum.repos.d/
+COPY images/repos.d/centos9-crb.repo /etc/yum.repos.d/
+COPY images/repos.d/centos9-appstream.repo /etc/yum.repos.d/
 RUN dnf -y install dnf-plugins-core && \
-    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
     # dnf config-manager --set-enabled powertools && \
     dnf -y update
-
-# use python38
-RUN dnf -y module disable python36
-RUN dnf -y module enable python38
 
 # lsof & procps-ng(`ps`) are needed for running pytests (unit/functional)
 #
@@ -36,57 +42,50 @@ RUN dnf -y module enable python38
 #
 # TODO: Investigate differences between `dnf builddep createrepo_c` vs the list
 # of dependencies below. For example, drpm-devel.
-RUN dnf -y install python38 python38-cryptography python38-devel && \
+RUN dnf -y install python${PYTHON_VERSION} python${PYTHON_VERSION}-cryptography python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip && \
     dnf -y install openssl openssl-devel && \
-    dnf -y install openldap-devel && \
     dnf -y install wget git && \
     dnf -y install lsof procps-ng && \
-    dnf -y install python3-psycopg2 && \
-    dnf -y install redhat-rpm-config gcc cargo libffi-devel && \
+    dnf -y install python${PYTHON_VERSION}-psycopg2 && \
+    dnf -y install redhat-rpm-config gcc && \
     dnf -y install glibc-langpack-en && \
-    dnf -y install python3-libmodulemd && \
-    dnf -y install python3-libcomps && \
-    dnf -y install libpq-devel && \
-    dnf -y install python3-setuptools && \
+    dnf -y install python${PYTHON_VERSION}-setuptools && \
     dnf -y install swig && \
-    dnf -y install buildah --exclude container-selinux && \
-    dnf -y install xz && \
-    dnf -y install libmodulemd-devel && \
-    dnf -y install libcomps-devel && \
-    dnf -y install zchunk-devel && \
-    dnf -y install ninja-build && \
-    dnf -y install cairo-devel cmake gobject-introspection-devel cairo-gobject-devel && \
-    dnf -y install libcurl-devel libxml2-devel sqlite-devel file-devel && \
+    dnf -y install ostree-libs ostree --allowerasing --nobest && \
+    dnf -y install patch && \
+    dnf -y install jq && \
     dnf -y install zstd
+
 RUN dnf clean all
+
+RUN python${PYTHON_VERSION} -m venv --system-site-packages /usr/local/lib/pulp
+
+ENV PATH="/usr/local/lib/pulp/bin:${PATH}"
 
 # Needed to prevent the wrong version of cryptography from being installed,
 # which would break PyOpenSSL.
 # Need to install optional dep, rhsm, for pulp-certguard
-RUN pip3 install --upgrade pip setuptools wheel && \
+RUN pip install --upgrade pip setuptools wheel && \
     rm -rf /root/.cache/pip && \
-    pip3 install  \
+    pip install  \
          rhsm \
          setproctitle \
-         gunicorn \
+         "gunicorn>=22.0,<25.1.0" \
          python-nginx \
          django-storages\[boto3,azure]\>=1.12.2 \
          requests\[use_chardet_on_py3] \
-         importlib-metadata && \
+         importlib-metadata \
+         watchtower && \
          rm -rf /root/.cache/pip
 
 
-RUN pip3 install --upgrade \
-  pulpcore==3.43.0 \
-  pulp-rpm==3.24.0 \
-  pulp-gem==0.4.0 && \
-  rm -rf /root/.cache/pip
+COPY pulp_service/ /tmp/pulp_service
 
-RUN sed 's|^#mount_program|mount_program|g' -i /etc/containers/storage.conf
+RUN pip install /tmp/pulp_service && \
+  rm -rf /root/.cache/pip
 
 RUN groupadd -g 700 --system pulp
 RUN useradd -d /var/lib/pulp --system -u 700 -g pulp pulp
-RUN usermod --add-subuids 100000-165535 --add-subgids 100000-165535 pulp
 
 RUN mkdir -p /etc/pulp/certs \
              /etc/ssl/pulp \
@@ -100,7 +99,6 @@ RUN mkdir -p /etc/pulp/certs \
 RUN chown pulp:pulp -R /var/lib/pulp \
                        /var/lib/operator/static
 
-COPY images/assets/readyz.py /usr/bin/readyz.py
 COPY images/assets/route_paths.py /usr/bin/route_paths.py
 COPY images/assets/wait_on_postgres.py /usr/bin/wait_on_postgres.py
 COPY images/assets/wait_on_database_migrations.sh /usr/bin/wait_on_database_migrations.sh
@@ -110,13 +108,90 @@ COPY images/assets/pulp-api /usr/bin/pulp-api
 COPY images/assets/pulp-content /usr/bin/pulp-content
 COPY images/assets/pulp-resource-manager /usr/bin/pulp-resource-manager
 COPY images/assets/pulp-worker /usr/bin/pulp-worker
+COPY images/assets/log_middleware.py /usr/bin/log_middleware.py
 
 USER pulp:pulp
 RUN PULP_STATIC_ROOT=/var/lib/operator/static/ PULP_CONTENT_ORIGIN=localhost \
-       /usr/local/bin/pulpcore-manager collectstatic --clear --noinput --link
+       pulpcore-manager collectstatic --clear --noinput --link
 USER root:root
+
+COPY --from=builder /opt/app-root/src/agent-scan /usr/bin/agent-scan
+
+# This path seems to be hardcoded in tests
+RUN ln -s /usr/local/lib/pulp/bin/pulpcore-manager /usr/local/bin/pulpcore-manager
 
 RUN chmod 2775 /var/lib/pulp/{scripts,media,tmp,assets}
 RUN chown :root /var/lib/pulp/{scripts,media,tmp,assets}
+
+COPY images/assets/patches/0010-Added-ability-to-return-a-URL-for-a-blob.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0010-Added-ability-to-return-a-URL-for-a-blob.patch
+
+COPY images/assets/patches/0011-ocistorage-backend-changes.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0011-ocistorage-backend-changes.patch
+
+COPY images/assets/patches/0014-Add-Content-Sources-periodic-telemetry-task.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0014-Add-Content-Sources-periodic-telemetry-task.patch
+
+COPY images/assets/patches/0018-Re-root-the-registry-API-at-api-pulp-v2.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0018-Re-root-the-registry-API-at-api-pulp-v2.patch
+
+COPY images/assets/patches/0022-Adds-authentication-to-the-mvn-deploy-api.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0022-Adds-authentication-to-the-mvn-deploy-api.patch
+
+COPY images/assets/patches/0024-Update-FileContent-filter-with-NAME_FILTER_OPTIONS.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0024-Update-FileContent-filter-with-NAME_FILTER_OPTIONS.patch
+
+COPY images/assets/patches/0025-clamAV.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0025-clamAV.patch
+
+
+COPY images/assets/patches/0028-OCIStorage-create-manifest.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0028-OCIStorage-create-manifest.patch
+
+
+COPY images/assets/patches/0031-Replace-ResponseContentDisposition-in-cloudfront.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0031-Replace-ResponseContentDisposition-in-cloudfront.patch
+
+COPY images/assets/patches/0032-Disable-the-timestamp-of-interest-query.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0032-Disable-the-timestamp-of-interest-query.patch
+
+COPY images/assets/patches/0034-Fix-profile-artifact-being-stored-in-default-domain.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0034-Fix-profile-artifact-being-stored-in-default-domain.patch
+
+COPY images/assets/patches/0035-Revert-Mitigate-a-disk-consumption-issue-during-sync.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0035-Revert-Mitigate-a-disk-consumption-issue-during-sync.patch
+
+COPY images/assets/patches/0038-readonly-pypi-endpoints.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0038-readonly-pypi-endpoints.patch
+
+COPY images/assets/patches/0047-Improve-repair_metadata-log-with-repo-and-package-na.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0047-Improve-repair_metadata-log-with-repo-and-package-na.patch
+
+
+COPY images/assets/patches/0044-Move-content-app-heartbeat-to-a-thread.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0044-Move-content-app-heartbeat-to-a-thread.patch
+
+COPY images/assets/patches/0045-Include-DRF-default-auth-classes-when-token-auth-is-disabled.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0045-Include-DRF-default-auth-classes-when-token-auth-is-disabled.patch
+
+
+COPY images/assets/keys/SIGSTORE-redhat-release3.pem /etc/pki/sigstore/SIGSTORE-redhat-release3
+COPY images/assets/patches/0048-Re-enable-attestation-verification-with-vendored-key.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0048-Re-enable-attestation-verification-with-vendored-key.patch
+
+COPY images/assets/patches/0049-Skip-content-units-validation.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0049-Skip-content-units-validation.patch
+
+COPY images/assets/patches/0052-pulpcore-agent-scan-report.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0052-pulpcore-agent-scan-report.patch
+
+COPY images/assets/patches/0053-python-agent-scan-task.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0053-python-agent-scan-task.patch
+
+COPY images/assets/patches/0054-defer-contentid-cleanup-old-versions.patch /tmp/
+RUN patch -p1 -d /usr/local/lib/pulp/lib/python${PYTHON_VERSION}/site-packages < /tmp/0054-defer-contentid-cleanup-old-versions.patch
+
+RUN mkdir /licenses
+COPY LICENSE /licenses/LICENSE
 
 EXPOSE 80
