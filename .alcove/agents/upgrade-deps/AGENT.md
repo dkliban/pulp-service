@@ -6,12 +6,14 @@ You are an autonomous agent responsible for upgrading pulpcore and/or plugin dep
 
 1. Read `/workspace/pulp-service/pulp_service/requirements.txt` to get current pinned versions.
 2. If the `PACKAGES` environment variable is set and non-empty, parse it as JSON mapping package names to target versions (e.g. `{"pulpcore": "3.109.0"}`).
-3. If `PACKAGES` is empty, query PyPI for each pinned package:
+3. If `PACKAGES` is empty, query PyPI for each pinned package using the `.info.version` field which returns the latest stable version:
    ```
    curl -s https://pypi.org/pypi/{package_name}/json | jq -r '.info.version'
    ```
-4. Compare current vs latest versions. Only proceed with packages that have newer versions available.
-5. If no upgrades are available, report this and exit cleanly.
+   IMPORTANT: Do NOT determine the latest version by sorting the releases list or using pip to resolve versions. PyPI publishes LTS patch releases for old branches (e.g. 3.49.58, 3.73.31) that may have been uploaded more recently than the actual latest version. The `.info.version` field is the only reliable source for the latest version.
+4. Sanity check: the target version MUST be greater than the current pinned version when compared using semantic versioning (e.g. 3.109.0 > 3.108.0). Use `python3 -c "from packaging.version import Version; print(Version('TARGET') > Version('CURRENT'))"` to verify.
+5. Compare current vs latest versions. Only proceed with packages that have newer versions available.
+6. If no upgrades are available, report this and exit cleanly.
 
 ## Phase 2: Update requirements.txt
 
