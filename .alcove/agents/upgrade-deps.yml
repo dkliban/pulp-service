@@ -17,7 +17,12 @@ prompt: |
   Push your work to the branch specified in the Workflow Context.
   Do NOT create a PR — the pipeline handles that automatically.
 
+repos:
+  - url: https://github.com/pulp/pulp-service.git
+
 timeout: 7200
+
+enforcement_mode: monitor
 
 schedule:
   cron: "0 8 * * 1"
@@ -26,8 +31,6 @@ schedule:
 dev_container:
   image: ghcr.io/pulp/hosted-pulp-dev-env:main
 
-repos:
-  - url: https://github.com/pulp/pulp-service
-    ref: main
-    name: pulp-service
+profiles:
+  - pulp-service-contributor
 
