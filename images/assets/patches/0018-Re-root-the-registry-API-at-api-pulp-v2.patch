@@ -1,21 +1,8 @@
-From ad565cd57a1d1f643d1fc2757965f22bbb164624 Mon Sep 17 00:00:00 2001
-From: Dennis Kliban <dkliban@redhat.com>
-Date: Tue, 4 Mar 2025 11:19:30 -0500
-Subject: [PATCH] Re-root the registry API at /api/pulp/v2/
-
----
- pulp_container/app/content.py            |  2 +-
- pulp_container/app/redirects.py          |  4 ++--
- pulp_container/app/registry_api.py       |  4 +++-
- pulp_container/app/token_verification.py | 16 +---------------
- pulp_container/app/urls.py               | 14 +++++++-------
- 5 files changed, 15 insertions(+), 27 deletions(-)
-
 diff --git a/pulp_container/app/content.py b/pulp_container/app/content.py
-index dbe6418d..006e8afb 100644
+index 145533fc..000c97fc 100644
 --- a/pulp_container/app/content.py
 +++ b/pulp_container/app/content.py
-@@ -6,7 +6,7 @@ from pulp_container.app.registry import Registry
+@@ -7,7 +7,7 @@ from pulp_container.app.registry import Registry
  
  registry = Registry()
  
@@ -25,10 +12,10 @@ index dbe6418d..006e8afb 100644
  app.add_routes(
      [
 diff --git a/pulp_container/app/redirects.py b/pulp_container/app/redirects.py
-index 0c7a5898..fa4808cb 100644
+index 2ac80050..c7694cd7 100644
 --- a/pulp_container/app/redirects.py
 +++ b/pulp_container/app/redirects.py
-@@ -21,7 +21,7 @@ class CommonRedirects:
+@@ -22,7 +22,7 @@ class CommonRedirects:
          self.path = path
          self.request = request
          self.path_prefix = (
@@ -38,10 +25,10 @@ index 0c7a5898..fa4808cb 100644
              else "pulp/container"
          )
 diff --git a/pulp_container/app/registry_api.py b/pulp_container/app/registry_api.py
-index e3b0766c..4e9114be 100644
+index 24b007ae..91a5e102 100644
 --- a/pulp_container/app/registry_api.py
 +++ b/pulp_container/app/registry_api.py
-@@ -98,6 +98,8 @@ from pulp_container.constants import (
+@@ -97,6 +97,8 @@ from pulp_container.constants import (
      V2_ACCEPT_HEADERS,
  )
  
@@ -50,28 +37,35 @@ index e3b0766c..4e9114be 100644
  log = logging.getLogger(__name__)
  
  IGNORED_PULL_THROUGH_REMOTE_ATTRIBUTES = [
-@@ -232,7 +234,7 @@ class ContainerRegistryApiMixin:
+@@ -229,9 +231,14 @@ class ContainerRegistryApiMixin:
+     def authentication_classes(self):
+         """
          List of authentication classes to check for this view.
++
++        When token auth is disabled, includes both RegistryAuthentication (Basic auth)
++        and any authentication classes configured in DEFAULT_AUTHENTICATION_CLASSES.
++        This allows deployments to use custom authentication backends (e.g. remote
++        header-based auth) alongside standard Basic auth for container registry operations.
          """
          if settings.get("TOKEN_AUTH_DISABLED", False):
 -            return [RegistryAuthentication]
-+            return [RHServiceAccountCertAuthentication]
++            return [RegistryAuthentication, *api_settings.DEFAULT_AUTHENTICATION_CLASSES]
          return [TokenAuthentication]
  
      @property
 diff --git a/pulp_container/app/token_verification.py b/pulp_container/app/token_verification.py
-index d78738a4..faf05cd6 100644
+index 019310ac..9c685b68 100644
 --- a/pulp_container/app/token_verification.py
 +++ b/pulp_container/app/token_verification.py
-@@ -15,6 +15,7 @@ from rest_framework.authentication import (
- from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated
- from rest_framework.permissions import BasePermission, SAFE_METHODS
+@@ -14,6 +14,7 @@ from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated
+ from rest_framework.permissions import SAFE_METHODS, BasePermission
+ 
  from pulp_container.app.utils import get_full_path
 +from pulp_service.app.authorization import DomainBasedPermission
  
  Scope = namedtuple("Scope", "resource_type, name, action")
  User = get_user_model()
-@@ -178,23 +179,11 @@ def get_scopes(request):
+@@ -177,23 +178,11 @@ def get_scopes(request):
      return scopes
  
  
@@ -97,10 +91,10 @@ index d78738a4..faf05cd6 100644
  
  class TokenPermission(BasePermission):
 diff --git a/pulp_container/app/urls.py b/pulp_container/app/urls.py
-index 47c4342a..6c93b927 100644
+index f1a54872..0b40d9a8 100644
 --- a/pulp_container/app/urls.py
 +++ b/pulp_container/app/urls.py
-@@ -32,16 +32,16 @@ head_route = Route(
+@@ -33,16 +33,16 @@ head_route = Route(
  )
  
  router.routes.append(head_route)
@@ -124,6 +118,3 @@ index 47c4342a..6c93b927 100644
      path("", include(router.urls)),
  ]
  # print(router.urls)
--- 
-2.49.0
-

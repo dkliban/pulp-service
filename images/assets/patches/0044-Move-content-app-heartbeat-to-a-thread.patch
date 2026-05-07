@@ -1,38 +1,32 @@
-From aa15b73667de977bf6f0caaab91d6909c431bb1e Mon Sep 17 00:00:00 2001
-From: Dennis Kliban <dkliban@redhat.com>
-Date: Wed, 11 Feb 2026 21:19:28 -0500
-Subject: [PATCH] Move content app's heartbeat to a thread.
-
----
- pulpcore/content/__init__.py | 33 +++++++++++++++++----------------
- 1 file changed, 17 insertions(+), 16 deletions(-)
-
 diff --git a/pulpcore/content/__init__.py b/pulpcore/content/__init__.py
-index 96e4f6a6d..9420c2abb 100644
+index decf0957b..336298c0f 100644
 --- a/pulpcore/content/__init__.py
 +++ b/pulpcore/content/__init__.py
-@@ -1,11 +1,10 @@
--import asyncio
- from contextlib import suppress
- from importlib import import_module
+@@ -6,6 +6,13 @@ from importlib import import_module
  from importlib.util import find_spec
- import logging
- import os
-+import threading
  
--from asgiref.sync import sync_to_async
- from aiohttp import web
- from gunicorn.arbiter import Arbiter
  import django
-@@ -15,6 +14,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pulpcore.app.settings")
- django.setup()
- 
- from django.conf import settings  # noqa: E402: module level not at top of file
++from contextlib import suppress
++from importlib import import_module
++from importlib.util import find_spec
++import logging
++import os
++import threading
++
+ from aiohttp import web
+ from asgiref.sync import sync_to_async
+ from gunicorn.arbiter import Arbiter
+@@ -16,6 +23,9 @@ django.setup()
+ from django.conf import settings  # noqa: E402
+ from django.db.utils import (  # noqa: E402
+     DatabaseError,
++from django.conf import settings  # noqa: E402: module level not at top of file
 +from django.db import connection  # noqa: E402: module level not at top of file
- from django.db.utils import (  # noqa: E402: module level not at top of file
++from django.db.utils import (  # noqa: E402: module level not at top of file
      IntegrityError,
      InterfaceError,
-@@ -48,7 +48,7 @@ if settings.UVLOOP_ENABLED:
+ )
+@@ -46,7 +56,7 @@ if settings.UVLOOP_ENABLED:
  CONTENT_MODULE_NAME = "content"
  
  
@@ -41,7 +35,7 @@ index 96e4f6a6d..9420c2abb 100644
      name = get_worker_name()
      heartbeat_interval = settings.CONTENT_APP_TTL // 4
      msg = "Content App '{name}' heartbeat written, sleeping for '{interarrival}' seconds".format(
-@@ -60,39 +60,40 @@ async def _heartbeat():
+@@ -58,39 +68,40 @@ async def _heartbeat():
      versions = {app.label: app.version for app in pulp_plugin_configs()}
  
      try:
@@ -95,6 +89,3 @@ index 96e4f6a6d..9420c2abb 100644
  
  
  async def server(*args, **kwargs):
--- 
-2.52.0
-

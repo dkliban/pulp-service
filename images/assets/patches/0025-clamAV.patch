@@ -1,34 +1,19 @@
-From eeab8cc111d03218b3f3b58200206b18aaa1f0b5 Mon Sep 17 00:00:00 2001
-From: Dennis Kliban <dkliban@redhat.com>
-Date: Tue, 24 Mar 2026 12:12:45 -0400
-Subject: [PATCH] Extend dwloader to push data stream through clamAV
-
----
- pulpcore/app/settings.py          |  4 +++
- pulpcore/content/handler.py       | 23 ++++++++++++++++-
- pulpcore/download/base.py         | 41 +++++++++++++++++++++++++++++++
- pulpcore/exceptions/__init__.py   |  1 +
- pulpcore/exceptions/validation.py | 19 ++++++++++++++
- pulpcore/plugin/exceptions.py     |  2 ++
- 6 files changed, 89 insertions(+), 1 deletion(-)
-
 diff --git a/pulpcore/app/settings.py b/pulpcore/app/settings.py
-index 7d30421f2..ffbc2ab30 100644
+index a4411f50e..69a4ad972 100644
 --- a/pulpcore/app/settings.py
 +++ b/pulpcore/app/settings.py
-@@ -425,6 +425,10 @@ VULN_REPORT_TASK_LIMITER = 10
- # Replaces asyncio event loop with uvloop
- UVLOOP_ENABLED = False
+@@ -438,6 +438,9 @@ UVLOOP_ENABLED = False
  
+ # Replaces every non PulpException error msg with "An internal error occured"
+ REDACT_UNSAFE_EXCEPTIONS = False
 +# ClamAV default config
 +CLAMAV_HOST = None
 +CLAMAV_PORT = None
-+
+ 
  # HERE STARTS DYNACONF EXTENSION LOAD (Keep at the very bottom of settings.py)
  # Read more at https://www.dynaconf.com/django/
- 
 diff --git a/pulpcore/content/handler.py b/pulpcore/content/handler.py
-index d00a53cba..51fffdc4d 100644
+index 56e9addf0..7787124a0 100644
 --- a/pulpcore/content/handler.py
 +++ b/pulpcore/content/handler.py
 @@ -17,6 +17,7 @@ from aiohttp.web_exceptions import (
@@ -38,19 +23,16 @@ index d00a53cba..51fffdc4d 100644
 +    HTTPPreconditionFailed,
      HTTPRequestRangeNotSatisfiable,
  )
- from yarl import URL
-@@ -60,8 +61,9 @@ from pulpcore.app.util import (  # noqa: E402: module level not at top of file
- )
- 
+ from asgiref.sync import sync_to_async
+@@ -62,6 +63,7 @@ from pulpcore.cache import AsyncContentCache  # noqa: E402
  from pulpcore.exceptions import (  # noqa: E402
--    UnsupportedDigestValidationError,
      DigestValidationError,
-+    UnsupportedDigestValidationError,
+     UnsupportedDigestValidationError,
 +    MalwareError,
  )
  from pulpcore.metrics import artifacts_size_counter  # noqa: E402
  
-@@ -916,6 +918,11 @@ class Handler:
+@@ -924,6 +926,11 @@ class Handler:
                              url=url, r=ce.message
                          )
                          raise Error(reason=reason)
@@ -62,7 +44,7 @@ index d00a53cba..51fffdc4d 100644
  
          if not any([repository, repo_version, publication, distro.remote]):
              reason = _(
-@@ -1298,6 +1305,10 @@ class Handler:
+@@ -1306,6 +1313,10 @@ class Handler:
          downloader.handle_data = handle_data
          original_finalize = downloader.finalize
          downloader.finalize = finalize
@@ -73,7 +55,7 @@ index d00a53cba..51fffdc4d 100644
          failed_download = True
          try:
              download_result = await downloader.run(
-@@ -1321,6 +1332,16 @@ class Handler:
+@@ -1329,6 +1340,16 @@ class Handler:
                  "Learn more on <https://pulpproject.org/pulpcore/docs/user/learn/"
                  "on-demand-downloading/#on-demand-and-streamed-limitations>"
              )
@@ -91,26 +73,25 @@ index d00a53cba..51fffdc4d 100644
              if failed_download:
                  # remove the temporary file
 diff --git a/pulpcore/download/base.py b/pulpcore/download/base.py
-index b093ad9e4..ab8acff4b 100644
+index 8900ff81c..2c34efbe6 100644
 --- a/pulpcore/download/base.py
 +++ b/pulpcore/download/base.py
-@@ -1,6 +1,7 @@
- from gettext import gettext as _
- 
+@@ -1,4 +1,6 @@
  import asyncio
 +from clamav_client import clamd
- from collections import namedtuple
++from collections import namedtuple
  import concurrent.futures
- from concurrent.futures import ThreadPoolExecutor, ALL_COMPLETED
-@@ -8,6 +9,7 @@ import logging
+ import logging
  import os
- import tempfile
+@@ -7,6 +9,7 @@ from collections import namedtuple
+ from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor
+ from gettext import gettext as _
  from pathlib import Path
 +import struct
  from urllib.parse import urlsplit
  
  from django.conf import settings
-@@ -18,6 +20,7 @@ from pulpcore.exceptions import (
+@@ -18,6 +21,7 @@ from pulpcore.exceptions import (
      SizeValidationError,
      TimeoutException,
      UnsupportedDigestValidationError,
@@ -118,7 +99,7 @@ index b093ad9e4..ab8acff4b 100644
  )
  
  log = logging.getLogger(__name__)
-@@ -114,6 +117,9 @@ class BaseDownloader:
+@@ -114,6 +118,9 @@ class BaseDownloader:
                      ).format(self.url, Artifact.DIGEST_FIELDS, set(self.expected_digests))
                  )
  
@@ -128,7 +109,7 @@ index b093ad9e4..ab8acff4b 100644
      def _ensure_writer_has_open_file(self):
          """
          Create a temporary file on demand.
-@@ -158,6 +164,7 @@ class BaseDownloader:
+@@ -158,6 +165,7 @@ class BaseDownloader:
          self._ensure_writer_has_open_file()
          self._writer.write(data)
          self._record_size_and_digests_for_data(data)
@@ -136,7 +117,7 @@ index b093ad9e4..ab8acff4b 100644
  
      async def finalize(self):
          """
-@@ -181,6 +188,7 @@ class BaseDownloader:
+@@ -181,6 +189,7 @@ class BaseDownloader:
          self._writer = None
          self.validate_digests()
          self.validate_size()
@@ -144,7 +125,7 @@ index b093ad9e4..ab8acff4b 100644
          log.debug(f"Downloaded file from {self.url}")
  
      def fetch(self, extra_data=None):
-@@ -210,6 +218,12 @@ class BaseDownloader:
+@@ -210,6 +219,12 @@ class BaseDownloader:
          concurrent.futures.wait(futures, timeout=None, return_when=ALL_COMPLETED)
          self._size += len(data)
  
@@ -157,7 +138,7 @@ index b093ad9e4..ab8acff4b 100644
      @property
      def artifact_attributes(self):
          """
-@@ -251,6 +265,25 @@ class BaseDownloader:
+@@ -251,6 +266,25 @@ class BaseDownloader:
              if actual_size != expected_size:
                  raise SizeValidationError(actual_size, expected_size, url=self.url)
  
@@ -183,7 +164,7 @@ index b093ad9e4..ab8acff4b 100644
      async def run(self, extra_data=None):
          """
          Run the downloader with concurrency restriction.
-@@ -306,3 +339,11 @@ class BaseDownloader:
+@@ -306,3 +340,11 @@ class BaseDownloader:
              :meth:`~pulpcore.plugin.download.BaseDownloader.finalize`.
          """
          raise NotImplementedError("Subclasses must define a _run() method that returns a coroutine")
@@ -196,10 +177,10 @@ index b093ad9e4..ab8acff4b 100644
 +            self.clamd_client._init_socket()
 +            self.clamd_client._send_command("INSTREAM")
 diff --git a/pulpcore/exceptions/__init__.py b/pulpcore/exceptions/__init__.py
-index 4c458e439..17e30978b 100644
+index e6b935de6..1887e9c61 100644
 --- a/pulpcore/exceptions/__init__.py
 +++ b/pulpcore/exceptions/__init__.py
-@@ -21,6 +21,7 @@ from .validation import (
+@@ -23,6 +23,7 @@ from .validation import (
      DigestValidationError,
      InvalidSignatureError,
      SizeValidationError,
@@ -208,10 +189,10 @@ index 4c458e439..17e30978b 100644
      MissingDigestValidationError,
      UnsupportedDigestValidationError,
 diff --git a/pulpcore/exceptions/validation.py b/pulpcore/exceptions/validation.py
-index 2131e5fce..94cd27ab1 100644
+index 985aad65d..65813d1bd 100644
 --- a/pulpcore/exceptions/validation.py
 +++ b/pulpcore/exceptions/validation.py
-@@ -74,6 +74,25 @@ class SizeValidationError(ValidationError):
+@@ -75,6 +75,25 @@ class SizeValidationError(ValidationError):
              return f"[{self.error_code}] " + msg.format(expected=self.expected, actual=self.actual)
  
  
@@ -238,17 +219,17 @@ index 2131e5fce..94cd27ab1 100644
      """
      Raised when attempting to save() an Artifact with an incomplete set of checksums.
 diff --git a/pulpcore/plugin/exceptions.py b/pulpcore/plugin/exceptions.py
-index 0406964ec..d1ffedd6a 100644
+index 3e7e33852..da0844785 100644
 --- a/pulpcore/plugin/exceptions.py
 +++ b/pulpcore/plugin/exceptions.py
 @@ -1,6 +1,7 @@
  from pulpcore.exceptions import (
-     ValidationError,
      DigestValidationError,
+     ExternalServiceError,
 +    MalwareError,
      InvalidSignatureError,
-     PulpException,
-     SizeValidationError,
+     MissingDigestValidationError,
+     PublishError,
 @@ -17,6 +18,7 @@ from pulpcore.exceptions import (
  __all__ = [
      "ValidationError",
@@ -257,6 +238,3 @@ index 0406964ec..d1ffedd6a 100644
      "InvalidSignatureError",
      "PulpException",
      "SizeValidationError",
--- 
-2.53.0
-

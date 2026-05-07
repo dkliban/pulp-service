@@ -1,21 +1,21 @@
 diff --git a/pulpcore/app/models/publication.py b/pulpcore/app/models/publication.py
-index f354f0dd5..edc41cb99 100644
+index b953be30d..7a90d8380 100644
 --- a/pulpcore/app/models/publication.py
 +++ b/pulpcore/app/models/publication.py
-@@ -12,6 +12,12 @@ from gettext import gettext as _
- from url_normalize import url_normalize
- from urllib.parse import urlparse, urljoin
- 
+@@ -12,6 +12,12 @@ from urllib.parse import urljoin, urlparse
+ import jq
+ from aiohttp.web_exceptions import HTTPNotFound
+ from django.conf import settings
 +import oras.client
 +import oras.oci
 +import oras.defaults
 +import base64
 +import requests
 +
- from aiohttp.web_exceptions import HTTPNotFound
- 
- from django.conf import settings
-@@ -198,6 +204,153 @@ class Publication(MasterModel):
+ from django.contrib.postgres.fields import HStoreField
+ from django.db import DatabaseError, IntegrityError, models, transaction
+ from django.utils import timezone
+@@ -196,6 +202,153 @@ class Publication(MasterModel):
          """
          pass
  
@@ -169,7 +169,7 @@ index f354f0dd5..edc41cb99 100644
      def __enter__(self):
          """
          Enter context.
-@@ -230,6 +383,12 @@ class Publication(MasterModel):
+@@ -228,6 +381,12 @@ class Publication(MasterModel):
                  self.finalize_new_publication()
                  self.complete = True
                  self.save()

@@ -1,0 +1,1 @@
+{"timestamp":"2026-05-07T13:01:26.349Z","command":"cd /tmp/pulp-upgrade-work/pulp-service && git diff -- images/assets/patches/CLAUDE.md","cwd":"/tmp/pulp-upgrade-work/pulp-service","sessionId":"32308a92-e4e8-4e07-b18e-2ff0b622b632"}
